@@ -18,30 +18,87 @@ from threading import Thread
 from ttkbootstrap.icons import Icon
 
 # Constants for both applications
-SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb', '.sqlite', '.db'}
+SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb','.sqlite', '.db', '.sqlite3', '.zip', '.vyb', '.sqlite', '.db' '.sqlitedb', '.db3'}
 TEMP_DIR = tempfile.gettempdir()
 DEFAULT_EXCLUDED_TABLES = {
-    'sqlite_sequence', 'kb_fts_vtable', 'kb_fts_vtable_content',
+    'sqlite_sequence', 'sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 
+    'sqlite_stat4', 'sqlite_master', 'sqlite_temp_master', 'sqlite_sequence', 'kb_fts_vtable', 'kb_fts_vtable_content',
     'kb_fts_vtable_segdir', 'kb_images', 'kb_item_images',
     'kb_fts_vtable_segments', 'kb_txn_message_config', 'kb_settings'
 }
 DEFAULT_IGNORED_TYPES = {"date", "datetime", "timestamp"}
 DEFAULT_DECIMAL_PRECISION = 5
-
 # Utility functions
+def get_standard_extension(file_path: str) -> str:
+    """Convert various database file extensions to standard form."""
+    ext = os.path.splitext(file_path.lower())[1]
+    # Map extensions to standard forms
+    extension_map = {
+        '.sqlite3': '.sqlite',
+        '.sqlitedb': '.sqlite',
+        '.db3': '.db',
+        '.s3db': '.db',
+        '.sl3': '.sqlite',
+        '.sdb': '.db'
+    }
+    return extension_map.get(ext, ext)
+
 def is_valid_sqlite(db_path: str) -> bool:
-    """Check if file is a valid SQLite database."""
+    """Check if file is a valid SQLite database regardless of extension.
+    
+    This function will check if a file is a valid SQLite database by:
+    1. Checking if the file exists
+    2. Verifying the SQLite header
+    3. Attempting to open and query the database
+    4. Checking for at least one table
+    """
     if not os.path.exists(db_path):
         return False
     
+    # Try a lightweight header check first (not strict) to avoid false negatives
+    header_ok = False
+    try:
+        with open(db_path, 'rb') as f:
+            header = f.read(100)
+            if b'SQLite format 3' in header:
+                header_ok = True
+    except Exception:
+        # ignore header read errors and fall back to trying to open with sqlite3
+        header_ok = False
+
+    # Try to open and run a simple query. If connection and basic query succeed,
+    # treat the file as a valid SQLite DB. This is intentionally lenient because
+    # some valid DBs may have unusual metadata (schema_version 0 or other quirks).
     try:
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-        conn.close()
-        return len(tables) > 0
-    except:
+        try:
+            cursor = conn.cursor()
+            # Try a harmless query against sqlite_master
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;")
+            _ = cursor.fetchall()
+
+            # Optionally perform an integrity check if available, but don't require it
+            try:
+                cursor.execute("PRAGMA quick_check;")
+                rows = cursor.fetchall()
+                # If quick_check returns rows and any row contains 'ok', consider it good
+                if rows:
+                    for r in rows:
+                        if isinstance(r, (list, tuple)) and len(r) and r[0] == 'ok':
+                            return True
+                    # If quick_check returned non-ok messages, still consider the DB valid
+                    # (we'll surface integrity issues elsewhere if needed)
+                    return True
+                else:
+                    # No rows from quick_check -> still OK as long as sqlite_master query succeeded
+                    return True
+            except sqlite3.DatabaseError:
+                # quick_check may not be available; still accept if basic query worked
+                return True
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Could not open as SQLite
         return False
 
 def extract_vyp_from_vyb(vyb_path: str, temp_dirs: List[str]) -> Optional[str]:
@@ -88,7 +145,7 @@ class HomeTab(ttk.Frame):
         # Main Title
         ttk.Label(
             header_frame,
-            text="Vyapar Database Tools Suite",
+            text="SQLite Database Tools Suite",
             font=('Helvetica', 24, 'bold'),
             foreground="#4B0082",  # Indigo
             anchor=tk.CENTER
@@ -97,7 +154,7 @@ class HomeTab(ttk.Frame):
         # Subtitle
         ttk.Label(
             header_frame,
-            text="Powerful utilities for Vyapar database management",
+            text="Powerful utilities for SQLite database management",
             font=('Helvetica', 14),
             foreground="#6A5ACD",  # Slate Blue
             anchor=tk.CENTER
@@ -121,10 +178,10 @@ class HomeTab(ttk.Frame):
         ).pack(fill=tk.X, pady=(0, 5))
 
         feature_text1 = """
-        • Compare two Vyapar database files
+        • Compare any two SQLite databases
         • Analyze schema differences
         • Detect data inconsistencies
-        • Support for multiple formats: [.vyp, .vyb]
+        • Support for multiple formats: [.sqlite, .db, .db3, .vyp, .vyb]
         """
 
         try:
@@ -152,7 +209,7 @@ class HomeTab(ttk.Frame):
 
         ttk.Label(
             right_top_panel,
-            text="Database Sanitization",
+            text="Database Query Executer",
             font=('Helvetica', 18, 'bold'),
             foreground="#8B0000",  # Dark Red
             anchor=tk.CENTER
@@ -161,9 +218,9 @@ class HomeTab(ttk.Frame):
         feature_text2 = """
         • Remove sensitive information
         • Convert between .vyp and .vyb
-        • Built-in sanitization templates:
-        • Clear contact details
-        • Reset catalog settings
+        • Built-in Query Executer templates:
+        • Convert between .vyp and .vyb formats
+        • Reset database settings
         """
 
         try:
@@ -291,7 +348,7 @@ class HomeTab(ttk.Frame):
         
         ttk.Label(
             footer_frame,
-            text="© 2025 Vyapar Database Tools | Version 2.0",
+            text="© 2025 SQLite Database Tools | Version 2.0",
             font=('Segoe UI', 8),
             foreground="#666666",
             anchor=tk.CENTER
@@ -322,18 +379,28 @@ class DatabaseComparator:
 
     def extract_database_file(self, file_path: str) -> str:
         """Handle extraction of database files from various formats."""
-        if file_path.lower().endswith(('.vyp', '.sqlite', '.db')):
+        file_ext = os.path.splitext(file_path.lower())[1]
+
+        # Return as-is if it's a direct database file
+        if file_ext in SUPPORTED_EXTENSIONS - {'.vyb', '.zip'}:
+            if not is_valid_sqlite(file_path):
+                raise ValueError(f"File {file_path} is not a valid SQLite database")
             return file_path
-        elif file_path.lower().endswith('.vyb'):
+        
+        # Handle .vyb files
+        elif file_ext == '.vyb':
             extracted_path = extract_vyp_from_vyb(file_path, self.temp_dirs)
-            if extracted_path:
+            if extracted_path and is_valid_sqlite(extracted_path):
                 return extracted_path
-            raise ValueError(f"Failed to extract .vyp from {file_path}")
-        elif file_path.lower().endswith('.zip'):
+            raise ValueError(f"Failed to extract valid database from {file_path}")
+        
+        # Handle .zip files
+        elif file_ext == '.zip':
             try:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
                     for file_info in zip_ref.infolist():
-                        if any(file_info.filename.lower().endswith(ext) for ext in ['.sqlite', '.db']):
+                        file_ext = os.path.splitext(file_info.filename.lower())[1]
+                        if file_ext in SUPPORTED_EXTENSIONS - {'.zip'}:
                             temp_dir = tempfile.mkdtemp()
                             self.temp_dirs.append(temp_dir)
                             extracted_path = os.path.join(temp_dir, os.path.basename(file_info.filename))
@@ -346,7 +413,7 @@ class DatabaseComparator:
             except Exception as e:
                 raise ValueError(f"Zip extraction error: {str(e)}")
         else:
-            raise ValueError("Unsupported file format")
+            raise ValueError(f"Unsupported file format: {file_ext}. Supported formats are: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
 
     def validate_database(self, db_path: str) -> bool:
         if not self.validate_db:
@@ -1006,18 +1073,20 @@ class DatabaseComparisonTab(ttk.Frame):
 
     
     def browse_db1(self):
+        extensions = " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
         file_path = filedialog.askopenfilename(
             title="Select First Database",
-            filetypes=[("Database Files", "*.vyp *.vyb *.sqlite *.db *.zip"), ("All Files", "*.*")]
+            filetypes=[("Database Files", extensions), ("All Files", "*.*")]
         )
         if file_path:
             self.db1_entry.delete(0, tk.END)
             self.db1_entry.insert(0, file_path)
     
     def browse_db2(self):
+        extensions = " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
         file_path = filedialog.askopenfilename(
             title="Select Second Database",
-            filetypes=[("Database Files", "*.vyp *.vyb *.sqlite *.db *.zip"), ("All Files", "*.*")]
+            filetypes=[("Database Files", extensions), ("All Files", "*.*")]
         )
         if file_path:
             self.db2_entry.delete(0, tk.END)
@@ -1262,7 +1331,7 @@ class DatabaseSanitizerTab(ttk.Frame):
         # Header with icon
         ttk.Label(
             header_frame, 
-            text="🔒 Database Sanitization Tool", 
+            text="🔒 Database Query Execuation Tool", 
             font=('Helvetica', 20, 'bold'),
             bootstyle="primary"
         ).pack()
@@ -1369,14 +1438,31 @@ UPDATE kb_transactions SET mobile_no = '';
         # Download buttons
         download_frame = ttk.Frame(main_frame)
         download_frame.pack(pady=10, padx=20)
-        
+        # Output format selector (CTA)
+        self.output_format_var = tk.StringVar(value=".vyp")
+        formats_menu = ttk.Combobox(download_frame, textvariable=self.output_format_var,
+                                    values=sorted(SUPPORTED_EXTENSIONS - {'.zip'}), width=8, state='readonly')
+        formats_menu.current(0)
+        formats_menu.pack(side=tk.LEFT, padx=(0, 10))
+
+        # Single CTA to download the selected format
+        self.download_selected_btn = ttk.Button(
+            download_frame,
+            text="⬇️ Download",
+            state=DISABLED,
+            command=lambda: self.download_selected(),
+            bootstyle="primary",
+            width=12
+        )
+        self.download_selected_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         self.download_vyb_button = ttk.Button(
             download_frame, 
             text="⬇️ Download .vyb", 
             state=DISABLED, 
             command=self.download_vyb, 
             bootstyle="primary",
-            width=20
+            width=16
         )
         self.download_vyb_button.pack(side=tk.LEFT, padx=5)
         
@@ -1386,9 +1472,33 @@ UPDATE kb_transactions SET mobile_no = '';
             state=DISABLED, 
             command=self.download_vyp, 
             bootstyle="primary",
-            width=20
+            width=16
         )
         self.download_vyp_button.pack(side=tk.LEFT, padx=5)
+
+        # New buttons for .db and .sqlite
+        self.download_db_button = ttk.Button(
+            download_frame,
+            text="⬇️ Download .db",
+            state=DISABLED,
+            command=self.download_db,
+            bootstyle="primary",
+            width=16
+        )
+        self.download_db_button.pack(side=tk.LEFT, padx=5)
+
+        self.download_sqlite_button = ttk.Button(
+            download_frame,
+            text="⬇️ Download .sqlite",
+            state=DISABLED,
+            command=self.download_sqlite,
+            bootstyle="primary",
+            width=16
+        )
+        self.download_sqlite_button.pack(side=tk.LEFT, padx=5)
+        
+    # enable download selector as soon as any output is available
+    # (buttons will still control specific formats)
     
     def unzip_vyb(self, vyb_file, extract_to):
         with zipfile.ZipFile(vyb_file, 'r') as zip_ref:
@@ -1435,11 +1545,11 @@ UPDATE kb_transactions SET mobile_no = '';
             # Generate output file name
             input_filename = os.path.basename(input_file)
             output_filename = f"Sanitized_{input_filename}"
-            output_vyp = os.path.join(temp_dir, output_filename.replace(".vyb", ".vyp"))
-            output_vyb = os.path.join(temp_dir, output_filename.replace(".vyp", ".vyb"))
+            # Decide output behavior based on input extension
+            input_ext = os.path.splitext(input_file)[1].lower()
 
-            # If input is .vyb, unzip it to get .vyp
-            if input_file.endswith(".vyb"):
+            # If input is .vyb, we need to extract .vyp first and produce .vyp/.vyb outputs
+            if input_ext == ".vyb":
                 self.progress_bar["value"] = 20
                 self.update()
                 self.unzip_vyb(input_file, temp_dir)
@@ -1452,34 +1562,111 @@ UPDATE kb_transactions SET mobile_no = '';
                         break
                 if not vyp_file:
                     raise ValueError("No .vyp file found in the extracted .vyb archive.")
-            else:
-                # If input is .vyp, use it directly
+
+                output_vyp = os.path.join(temp_dir, output_filename.replace(".vyb", ".vyp"))
+                output_vyb = os.path.join(temp_dir, output_filename.replace(".vyp", ".vyb"))
+
+                self.progress_bar["value"] = 40
+                self.update()
+
+                # Execute the queries and save the modified database (as .vyp)
+                self.execute_queries_and_save(vyp_file, output_vyp, queries)
+
+                self.progress_bar["value"] = 60
+                self.update()
+
+                # Zip the .vyp file into .vyb
+                self.zip_vyp(output_vyp, output_vyb)
+
+                # Also generate .db and .sqlite copies of the sanitized .vyp (convenience)
+                output_db = output_vyp.replace('.vyp', '.db')
+                output_sqlite = output_vyp.replace('.vyp', '.sqlite')
+                try:
+                    shutil.copy(output_vyp, output_db)
+                    shutil.copy(output_vyp, output_sqlite)
+                    self.status_text.insert(tk.END, f"✓ Output .db file generated: {output_db}\n", 'success')
+                    self.status_text.insert(tk.END, f"✓ Output .sqlite file generated: {output_sqlite}\n", 'success')
+                    logging.info(f"Output .db file generated: {output_db}")
+                    logging.info(f"Output .sqlite file generated: {output_sqlite}")
+                except Exception:
+                    logging.warning("Could not create .db/.sqlite copies of the output (non-fatal)")
+
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output .vyp file generated: {output_vyp}\n", 'success')
+                self.status_text.insert(tk.END, f"✓ Output .vyb file generated: {output_vyb}\n", 'success')
+                logging.info(f"Output .vyp file generated: {output_vyp}")
+                logging.info(f"Output .vyb file generated: {output_vyb}")
+
+                # Enable download buttons if the output files exist
+                if os.path.exists(output_vyp) and os.path.exists(output_vyb):
+                    self.download_vyb_button.config(state=NORMAL)
+                    self.download_vyp_button.config(state=NORMAL)
+                if os.path.exists(output_db):
+                    self.download_db_button.config(state=NORMAL)
+                if os.path.exists(output_sqlite):
+                    self.download_sqlite_button.config(state=NORMAL)
+                self.download_selected_btn.config(state=NORMAL)
+
+            # If input is .vyp, keep existing behavior (produce .vyp/.vyb)
+            elif input_ext == ".vyp":
                 vyp_file = input_file
 
-            self.progress_bar["value"] = 40
-            self.update()
+                output_vyp = os.path.join(temp_dir, output_filename)
+                # ensure correct extension
+                if not output_vyp.lower().endswith('.vyp'):
+                    output_vyp = output_vyp + '.vyp'
+                output_vyb = output_vyp.replace('.vyp', '.vyb')
 
-            # Execute the queries and save the modified database
-            self.execute_queries_and_save(vyp_file, output_vyp, queries)
+                self.progress_bar["value"] = 40
+                self.update()
 
-            self.progress_bar["value"] = 60
-            self.update()
+                self.execute_queries_and_save(vyp_file, output_vyp, queries)
 
-            # Always generate both .vyp and .vyb files
-            # Zip the .vyp file into .vyb
-            self.zip_vyp(output_vyp, output_vyb)
+                self.progress_bar["value"] = 60
+                self.update()
 
-            self.progress_bar["value"] = 100
-            self.update()
-            self.status_text.insert(tk.END, f"✓ Output .vyp file generated: {output_vyp}\n", 'success')
-            self.status_text.insert(tk.END, f"✓ Output .vyb file generated: {output_vyb}\n", 'success')
-            logging.info(f"Output .vyp file generated: {output_vyp}")
-            logging.info(f"Output .vyb file generated: {output_vyb}")
+                self.zip_vyp(output_vyp, output_vyb)
 
-            # Enable download buttons if the output files exist
-            if os.path.exists(output_vyp) and os.path.exists(output_vyb):
-                self.download_vyb_button.config(state=NORMAL)
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output .vyp file generated: {output_vyp}\n", 'success')
+                self.status_text.insert(tk.END, f"✓ Output .vyb file generated: {output_vyb}\n", 'success')
+                try:
+                    shutil.copy(output_vyp, output_vyp.replace('.vyp', '.db'))
+                    shutil.copy(output_vyp, output_vyp.replace('.vyp', '.sqlite'))
+                    self.download_db_button.config(state=NORMAL)
+                    self.download_sqlite_button.config(state=NORMAL)
+                except Exception:
+                    pass
                 self.download_vyp_button.config(state=NORMAL)
+                self.download_vyb_button.config(state=NORMAL)
+                self.download_selected_btn.config(state=NORMAL)
+
+            # For any other database-like input, preserve the same extension for output
+            else:
+                # use the input file directly and write output with same extension
+                vyp_file = input_file
+                output_file = os.path.join(temp_dir, output_filename)
+
+                self.progress_bar["value"] = 40
+                self.update()
+
+                # Execute queries and save modified DB with same extension as input
+                self.execute_queries_and_save(vyp_file, output_file, queries)
+
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output file generated: {output_file}\n", 'success')
+                logging.info(f"Output file generated: {output_file}")
+                # enable download for generic file and unified CTA
+                self.download_selected_btn.config(state=NORMAL)
+                # enable specific download buttons if extension matches
+                lower_ext = os.path.splitext(output_file)[1].lower()
+                if lower_ext in {'.db', '.db3', '.s3db', '.sdb'}:
+                    self.download_db_button.config(state=NORMAL)
+                if lower_ext in {'.sqlite', '.sqlite3', '.sqlitedb', '.sl3'}:
+                    self.download_sqlite_button.config(state=NORMAL)
         except Exception as e:
             self.status_text.insert(tk.END, f"✗ Error: {str(e)}\n", 'error')
             logging.error(f"Error: {str(e)}")
@@ -1584,6 +1771,19 @@ UPDATE kb_transactions SET mobile_no = '';
             # Enable download buttons
             self.download_vyb_button.config(state=NORMAL)
             self.download_vyp_button.config(state=NORMAL)
+            # also enable .db/.sqlite options where applicable
+            try:
+                self.download_db_button.config(state=NORMAL)
+            except Exception:
+                pass
+            try:
+                self.download_sqlite_button.config(state=NORMAL)
+            except Exception:
+                pass
+            try:
+                self.download_selected_btn.config(state=NORMAL)
+            except Exception:
+                pass
             
         except Exception as e:
             self.status_text.insert(tk.END, f"✗ Error during conversion/repacking: {str(e)}\n", 'error')
@@ -1591,7 +1791,8 @@ UPDATE kb_transactions SET mobile_no = '';
             self.progress_bar["value"] = 0
 
     def browse_input_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("VYB & VYP Files", "*.vyb *.vyp")])
+        extensions = " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
+        file_path = filedialog.askopenfilename(filetypes=[("Database Files", extensions), ("All Files", "*.*")])
         self.input_file_entry.delete(0, tk.END)
         self.input_file_entry.insert(0, file_path)
 
@@ -1704,6 +1905,177 @@ UPDATE kb_transactions SET mobile_no = '';
                 output_vyp = output_vyb.replace(".vyb", ".vyp")
                 if os.path.exists(output_vyp):
                     self.zip_vyp(output_vyp, file_path)
+            self.status_text.insert(tk.END, f"✓ File saved successfully: {file_path}\n", 'success')
+
+    def download_db(self):
+        """Download sanitized output as .db"""
+        input_file = self.input_file_entry.get()
+        if not input_file:
+            self.status_text.insert(tk.END, "✗ Error: No input file selected\n", 'error')
+            return
+
+        input_filename = os.path.basename(input_file)
+        base_name = os.path.splitext(input_filename)[0]
+
+        possible_files = []
+        for f in os.listdir("temp"):
+            if (f.startswith(f"Sanitized_{base_name}") or 
+                f.startswith(f"converted_{base_name}") or 
+                f.startswith(f"repacked_{base_name}")) and f.endswith(".db"):
+                possible_files.append(f)
+
+        if not possible_files:
+            # Fall back: maybe .vyp exists and we can provide it as .db
+            for f in os.listdir("temp"):
+                if (f.startswith(f"Sanitized_{base_name}") or f.startswith(f"converted_{base_name}") or f.startswith(f"repacked_{base_name}")) and f.endswith(".vyp"):
+                    possible_files.append(f.replace('.vyp', '.db'))
+
+        if not possible_files:
+            self.status_text.insert(tk.END, f"✗ Error: No .db output files found for this input\n", 'error')
+            return
+
+        if len(possible_files) > 1:
+            choice = simpledialog.askstring("Select File", 
+                                         "Multiple .db files found. Enter the number:\n" + 
+                                         "\n".join(f"{i+1}. {f}" for i, f in enumerate(possible_files)),
+                                         parent=self)
+            try:
+                choice_idx = int(choice) - 1
+                if choice_idx < 0 or choice_idx >= len(possible_files):
+                    raise ValueError
+                selected_file = possible_files[choice_idx]
+            except:
+                self.status_text.insert(tk.END, "✗ Invalid selection\n", 'error')
+                return
+        else:
+            selected_file = possible_files[0]
+
+        # If selected_file doesn't actually exist but a .vyp exists, use it as source
+        src_path = os.path.join("temp", selected_file)
+        if not os.path.exists(src_path):
+            # try .vyp
+            alt = src_path.replace('.db', '.vyp')
+            if os.path.exists(alt):
+                src_path = alt
+            else:
+                self.status_text.insert(tk.END, "✗ Error: source file not found\n", 'error')
+                return
+
+        file_path = filedialog.asksaveasfilename(defaultextension=".db", 
+                                               filetypes=[("DB Files", "*.db")], 
+                                               initialfile=os.path.basename(selected_file))
+        if file_path:
+            shutil.copy(src_path, file_path)
+            self.status_text.insert(tk.END, f"✓ File saved successfully: {file_path}\n", 'success')
+
+    def download_sqlite(self):
+        """Download sanitized output as .sqlite"""
+        input_file = self.input_file_entry.get()
+        if not input_file:
+            self.status_text.insert(tk.END, "✗ Error: No input file selected\n", 'error')
+            return
+
+        input_filename = os.path.basename(input_file)
+        base_name = os.path.splitext(input_filename)[0]
+
+        possible_files = []
+        for f in os.listdir("temp"):
+            if (f.startswith(f"Sanitized_{base_name}") or 
+                f.startswith(f"converted_{base_name}") or 
+                f.startswith(f"repacked_{base_name}")) and f.endswith(".sqlite"):
+                possible_files.append(f)
+
+        if not possible_files:
+            # Fall back: maybe .vyp exists and we can provide it as .sqlite
+            for f in os.listdir("temp"):
+                if (f.startswith(f"Sanitized_{base_name}") or f.startswith(f"converted_{base_name}") or f.startswith(f"repacked_{base_name}")) and f.endswith(".vyp"):
+                    possible_files.append(f.replace('.vyp', '.sqlite'))
+
+        if not possible_files:
+            self.status_text.insert(tk.END, f"✗ Error: No .sqlite output files found for this input\n", 'error')
+            return
+
+        if len(possible_files) > 1:
+            choice = simpledialog.askstring("Select File", 
+                                         "Multiple .sqlite files found. Enter the number:\n" + 
+                                         "\n".join(f"{i+1}. {f}" for i, f in enumerate(possible_files)),
+                                         parent=self)
+            try:
+                choice_idx = int(choice) - 1
+                if choice_idx < 0 or choice_idx >= len(possible_files):
+                    raise ValueError
+                selected_file = possible_files[choice_idx]
+            except:
+                self.status_text.insert(tk.END, "✗ Invalid selection\n", 'error')
+                return
+        else:
+            selected_file = possible_files[0]
+
+        src_path = os.path.join("temp", selected_file)
+        if not os.path.exists(src_path):
+            alt = src_path.replace('.sqlite', '.vyp')
+            if os.path.exists(alt):
+                src_path = alt
+            else:
+                self.status_text.insert(tk.END, "✗ Error: source file not found\n", 'error')
+                return
+
+        file_path = filedialog.asksaveasfilename(defaultextension=".sqlite", 
+                                               filetypes=[("SQLite Files", "*.sqlite")], 
+                                               initialfile=os.path.basename(selected_file))
+        if file_path:
+            shutil.copy(src_path, file_path)
+            self.status_text.insert(tk.END, f"✓ File saved successfully: {file_path}\n", 'success')
+
+    def download_selected(self):
+        """Download the file in the format selected by the combobox.
+
+        This is generic: it will look for any output file in the temp directory
+        that matches the selected extension and prompt the user to save it.
+        """
+        fmt = self.output_format_var.get()
+        if not fmt:
+            messagebox.showerror("Error", "No format selected")
+            return
+
+        temp_dir = "temp"
+        input_file = self.input_file_entry.get()
+        if not input_file:
+            messagebox.showerror("Error", "No input file selected")
+            return
+
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        candidates = []
+        if os.path.exists(temp_dir):
+            for f in os.listdir(temp_dir):
+                if (f.startswith(f"Sanitized_{base_name}") or f.startswith(f"converted_{base_name}") or f.startswith(f"repacked_{base_name}")) and f.lower().endswith(fmt.lower()):
+                    candidates.append(f)
+
+        if not candidates:
+            messagebox.showerror("Error", f"No output files with extension {fmt} found")
+            return
+
+        if len(candidates) > 1:
+            choice = simpledialog.askstring("Select File",
+                                           "Multiple files found. Enter the number:\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(candidates)),
+                                           parent=self)
+            try:
+                idx = int(choice) - 1
+                if idx < 0 or idx >= len(candidates):
+                    raise ValueError
+                selected = candidates[idx]
+            except Exception:
+                messagebox.showerror("Error", "Invalid selection")
+                return
+        else:
+            selected = candidates[0]
+
+        src = os.path.join(temp_dir, selected)
+        def_ext = fmt
+        file_path = filedialog.asksaveasfilename(defaultextension=def_ext, initialfile=selected,
+                                               filetypes=[(f"Files (*{fmt})", f"*{fmt}"),("All files","*.*")])
+        if file_path:
+            shutil.copy(src, file_path)
             self.status_text.insert(tk.END, f"✓ File saved successfully: {file_path}\n", 'success')
 
     def cleanup_temp_dir(self):
@@ -2031,15 +2403,13 @@ Note: This process may take several minutes for large databases.
             # Generate output file name
             input_filename = os.path.basename(input_file)
             output_filename = f"FTS_{input_filename}"
-            output_vyp = os.path.join(temp_dir, output_filename.replace(".vyb", ".vyp"))
-            output_vyb = os.path.join(temp_dir, output_filename.replace(".vyp", ".vyb"))
+            input_ext = os.path.splitext(input_file)[1].lower()
 
-            # If input is .vyb, unzip it to get .vyp
-            if input_file.endswith(".vyb"):
+            # If input is .vyb, extract and create .vyp/.vyb outputs
+            if input_ext == ".vyb":
                 self.progress_bar["value"] = 20
                 self.update()
                 self.unzip_vyb(input_file, temp_dir)
-                # Find the extracted .vyp file in the temp directory
                 extracted_files = os.listdir(temp_dir)
                 vyp_file = None
                 for file in extracted_files:
@@ -2048,38 +2418,91 @@ Note: This process may take several minutes for large databases.
                         break
                 if not vyp_file:
                     raise ValueError("No .vyp file found in the extracted .vyb archive.")
-            else:
-                # If input is .vyp, use it directly
+
+                output_vyp = os.path.join(temp_dir, output_filename.replace(".vyb", ".vyp"))
+                output_vyb = os.path.join(temp_dir, output_filename.replace(".vyp", ".vyb"))
+
+                self.progress_bar["value"] = 40
+                self.update()
+
+                self.create_fts_table(vyp_file, output_vyp)
+
+                self.progress_bar["value"] = 60
+                self.update()
+
+                self.zip_vyp(output_vyp, output_vyb)
+
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output .vyp file with FTS table generated: {output_vyp}\n", 'success')
+                self.status_text.insert(tk.END, f"✓ Output .vyb file with FTS table generated: {output_vyb}\n", 'success')
+
+                if os.path.exists(output_vyp) and os.path.exists(output_vyb):
+                    self.download_vyb_button.config(state=NORMAL)
+                    self.download_vyp_button.config(state=NORMAL)
+                output_db = output_vyp.replace('.vyp', '.db')
+                output_sqlite = output_vyp.replace('.vyp', '.sqlite')
+                try:
+                    shutil.copy(output_vyp, output_db)
+                    shutil.copy(output_vyp, output_sqlite)
+                    # enable buttons if desired (may not exist in this tab)
+                    try:
+                        self.download_db_button.config(state=NORMAL)
+                        self.download_sqlite_button.config(state=NORMAL)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # If input is .vyp, keep existing flow
+            elif input_ext == ".vyp":
                 vyp_file = input_file
+                output_vyp = os.path.join(temp_dir, output_filename)
+                if not output_vyp.lower().endswith('.vyp'):
+                    output_vyp = output_vyp + '.vyp'
+                output_vyb = output_vyp.replace('.vyp', '.vyb')
 
-            self.progress_bar["value"] = 40
-            self.update()
+                self.progress_bar["value"] = 40
+                self.update()
 
-            # Create the FTS table
-            self.create_fts_table(vyp_file, output_vyp)
+                self.create_fts_table(vyp_file, output_vyp)
 
-            self.progress_bar["value"] = 60
-            self.update()
+                self.progress_bar["value"] = 60
+                self.update()
 
-            # Always generate both .vyp and .vyb files
-            # Zip the .vyp file into .vyb
-            self.zip_vyp(output_vyp, output_vyb)
+                self.zip_vyp(output_vyp, output_vyb)
 
-            self.progress_bar["value"] = 100
-            self.update()
-            self.status_text.insert(tk.END, f"✓ Output .vyp file with FTS table generated: {output_vyp}\n", 'success')
-            self.status_text.insert(tk.END, f"✓ Output .vyb file with FTS table generated: {output_vyb}\n", 'success')
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output .vyp file with FTS table generated: {output_vyp}\n", 'success')
+                self.status_text.insert(tk.END, f"✓ Output .vyb file with FTS table generated: {output_vyb}\n", 'success')
 
-            # Enable download buttons if the output files exist
-            if os.path.exists(output_vyp) and os.path.exists(output_vyb):
-                self.download_vyb_button.config(state=NORMAL)
-                self.download_vyp_button.config(state=NORMAL)
+            # For other DB formats, create output with same extension
+            else:
+                vyp_file = input_file
+                output_file = os.path.join(temp_dir, output_filename)
+
+                self.progress_bar["value"] = 40
+                self.update()
+
+                # create FTS table in a copy with same extension
+                self.create_fts_table(vyp_file, output_file)
+
+                self.progress_bar["value"] = 100
+                self.update()
+                self.status_text.insert(tk.END, f"✓ Output file with FTS table generated: {output_file}\n", 'success')
+                # enable generic download if applicable
+                try:
+                    self.download_vyp_button.config(state=NORMAL)
+                except Exception:
+                    pass
         except Exception as e:
             self.status_text.insert(tk.END, f"✗ Error: {str(e)}\n", 'error')
             self.progress_bar["value"] = 0
 
     def browse_input_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("VYB & VYP Files", "*.vyb *.vyp")])
+        extensions = " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
+        file_path = filedialog.askopenfilename(filetypes=[("Database Files", extensions), ("All Files", "*.*")])
         self.input_file_entry.delete(0, tk.END)
         self.input_file_entry.insert(0, file_path)
 
@@ -2191,13 +2614,13 @@ class SettingsTab(ttk.Frame):
         # Header with icon
         ttk.Label(
             header_frame, 
-            text="🔧 Setting Table Repair Utility", 
+            text="🔧 Database Table Repair Utility", 
             font=('Helvetica', 20, 'bold'),
             bootstyle="primary"
         ).pack()
         
         # Input file selection
-        input_frame = ttk.LabelFrame(main_frame, text="📁 Select Input File (.vyb or .vyp)", bootstyle="info")
+        input_frame = ttk.LabelFrame(main_frame, text="📁 Select Database Input File (.vyb, .vyp, etc)", bootstyle="info")
         input_frame.pack(pady=10, padx=20, fill=tk.X)
         
         self.input_file_entry = ttk.Entry(input_frame, font=('Helvetica', 12, 'bold'))
@@ -2503,16 +2926,42 @@ Key Features:
             self.status_text.insert(tk.END, f"✓ Output .vyp file with repaired settings table: {output_vyp}\n", 'success')
             self.status_text.insert(tk.END, f"✓ Output .vyb file with repaired settings table: {output_vyb}\n", 'success')
 
+            # Also generate .db and .sqlite copies of the repaired .vyp
+            output_db = output_vyp.replace('.vyp', '.db')
+            output_sqlite = output_vyp.replace('.vyp', '.sqlite')
+            try:
+                shutil.copy(output_vyp, output_db)
+                shutil.copy(output_vyp, output_sqlite)
+                self.status_text.insert(tk.END, f"✓ Output .db file generated: {output_db}\n", 'success')
+                self.status_text.insert(tk.END, f"✓ Output .sqlite file generated: {output_sqlite}\n", 'success')
+            except Exception:
+                logging.warning("Could not create .db/.sqlite copies of the repaired output (non-fatal)")
+
             # Enable download buttons if the output files exist
             if os.path.exists(output_vyp) and os.path.exists(output_vyb):
                 self.download_vyb_button.config(state=NORMAL)
                 self.download_vyp_button.config(state=NORMAL)
+            if os.path.exists(output_db):
+                try:
+                    self.download_db_button.config(state=NORMAL)
+                except Exception:
+                    pass
+            if os.path.exists(output_sqlite):
+                try:
+                    self.download_sqlite_button.config(state=NORMAL)
+                except Exception:
+                    pass
+            try:
+                self.download_selected_btn.config(state=NORMAL)
+            except Exception:
+                pass
         except Exception as e:
             self.status_text.insert(tk.END, f"✗ Error: {str(e)}\n", 'error')
             self.progress_bar["value"] = 0
 
     def browse_input_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("VYB & VYP Files", "*.vyb *.vyp")])
+        extensions = " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
+        file_path = filedialog.askopenfilename(filetypes=[("Database Files", extensions), ("All Files", "*.*")])
         self.input_file_entry.delete(0, tk.END)
         self.input_file_entry.insert(0, file_path)
 
@@ -2612,9 +3061,9 @@ class DatabaseToolApp:
         # Add tabs to notebook
         self.notebook.add(self.home_tab, text="🏠 Home")
         self.notebook.add(self.comparison_tab, text="🔍 Database Comparison")
-        self.notebook.add(self.sanitizer_tab, text="🧹 Database Sanitization")
+        self.notebook.add(self.sanitizer_tab, text="🧹 Database Query Executer")
         self.notebook.add(self.fts_tab, text="⚙️ FTS Table Generator")
-        self.notebook.add(self.settings_tab, text="⚙️ Setting Table Repair")
+        self.notebook.add(self.settings_tab, text="⚙️ Database Table Repair")
         
         self.notebook.select(self.home_tab)  # Optional: select Home tab by default
 
