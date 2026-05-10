@@ -1,0 +1,71 @@
+{
+  "name": "db-explorer-pro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Modern desktop UI for DB Explorer Pro",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "backend": "python backend/run.py",
+    "dev:ui": "vite --host 127.0.0.1",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && electron .",
+    "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
+    "build:backend": "python -m PyInstaller --name dbcompare-api --onefile --distpath backend-dist --workpath build/pyinstaller backend/run.py",
+    "build:ui": "tsc && vite build",
+    "build": "npm run build:ui",
+    "pack": "npm run build:backend && npm run build && electron-builder --dir",
+    "dist:win": "npm run build:backend && npm run build && electron-builder --win nsis portable",
+    "dist:mac": "npm run build:backend && npm run build && electron-builder --mac dmg"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "^7.0.0",
+    "typescript": "^5.8.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "lucide-react": "^0.468.0",
+    "electron": "^33.0.0",
+    "concurrently": "^9.0.0",
+    "wait-on": "^8.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^25.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/node": "^22.0.0"
+  },
+  "build": {
+    "appId": "com.dbexplorerpro.desktop",
+    "productName": "DB Explorer Pro",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend-dist",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "electron/assets/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "electron/assets/icon.icns",
+      "category": "public.app-category.developer-tools"
+    }
+  }
+}

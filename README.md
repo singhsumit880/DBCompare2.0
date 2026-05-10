@@ -9,13 +9,13 @@ This repository provides tools to compare two databases, sanitize data, generate
 Create a virtual environment (recommended) and install dependencies listed in `requirements.txt`:
 
 
-## Quick start
+## Quick start - legacy Tkinter app
 
 - Run the app:
 
 PowerShell:
 ```powershell
-python db.py
+python main.py
 ```
 
 - Select input files. Supported input types include common SQLite extensions (for example: `.db`, `.sqlite`, `.db3`, `.sqlitedb`, `.s3db`, `.sl3`) as well as `.vyp` and `.vyb`.
@@ -28,6 +28,22 @@ Notes:
 ## Contributing
 
 PRs welcome. If you add features that require new dependencies, please update `requirements.txt` and the README install instructions.
+
+## Modern desktop UI
+
+A new Electron + React UI is being developed beside the existing Tkinter app.
+It uses a local Python FastAPI backend so the existing database logic in `core/`
+stays intact.
+
+Development:
+
+```powershell
+pip install -r requirements.txt
+npm install
+npm run dev
+```
+
+Packaging notes for `.exe` and `.dmg` are in `docs/modern-ui-plan.md`.
 
 
 

@@ -1,0 +1,15 @@
+# Added by code-review-graph
+.code-review-graph/
+__pycache__/
+*.pyc
+temp_*/
+temp_sanitize/
+temp_fts/
+temp_settings/
+node_modules/
+dist/
+dist-electron/
+build/
+.vite/
+.env
+
