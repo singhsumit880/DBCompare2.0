@@ -26,6 +26,7 @@ const requiredDevRoutes = [
   "/api/sql/checks",
   "/api/sql/version",
   "/api/sql/rows",
+  "/api/sql/update-row",
   "/api/sql/related-rows",
   "/api/sql/query"
 ];
@@ -177,7 +178,7 @@ function createWindow() {
     minHeight: 760,
     title: "DB Explorer Pro",
     icon: path.join(__dirname, "assets", process.platform === "darwin" ? "icon.icns" : "icon-512.png"),
-    backgroundColor: "#111827",
+    backgroundColor: "#f5f6fb",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

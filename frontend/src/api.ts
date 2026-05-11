@@ -1,4 +1,4 @@
-import type { CompareJobStatus, ComparisonReport, SqlQueryResult, ToolRunResult } from "./types";
+import type { CompareJobStatus, ComparisonReport, RowUpdateResult, SqlQueryResult, TableColumn, ToolRunResult } from "./types";
 
 const baseUrl = window.dbcompare?.apiBaseUrl ?? "http://127.0.0.1:8765";
 
@@ -82,7 +82,7 @@ export function tableInfo(dbPath: string, table: string) {
   return post<{
     table: string;
     row_count: number;
-    columns: { name: string; type: string; pk: number }[];
+    columns: TableColumn[];
     foreign_keys: { table: string; from: string; to: string }[];
   }>("/api/sql/table-info", { db_path: dbPath, table });
 }
@@ -104,6 +104,20 @@ export function tableRows(dbPath: string, table: string, limit = 1000, offset = 
     `/api/sql/rows?limit=${limit}&offset=${offset}`,
     { db_path: dbPath, table }
   );
+}
+
+export function updateRow(
+  dbPath: string,
+  table: string,
+  key: Record<string, unknown>,
+  values: Record<string, unknown>
+) {
+  return post<RowUpdateResult>("/api/sql/update-row", {
+    db_path: dbPath,
+    table,
+    key,
+    values
+  });
 }
 
 export function executeSql(dbPath: string, sql: string, allowWrite = false, limit = 500) {

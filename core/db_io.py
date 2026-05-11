@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from core.utils import unzip_vyb, find_vyp_in_dir, get_temp_dir, cleanup_dir
 
-SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb', '.sqlite', '.db'}
+SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb', '.sqlite', '.sqlite3', '.db'}
 
 
 def is_valid_sqlite(db_path: str) -> bool:
@@ -63,7 +63,7 @@ def extract_database_file(file_path: str, temp_dirs: List[str]) -> str:
     """
     ext = os.path.splitext(file_path)[1].lower()
 
-    if ext in ('.vyp', '.sqlite', '.db'):
+    if ext in ('.vyp', '.sqlite', '.sqlite3', '.db'):
         return file_path
 
     if ext == '.vyb':

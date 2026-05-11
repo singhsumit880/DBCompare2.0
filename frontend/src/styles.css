@@ -814,6 +814,18 @@ tbody tr.clean td {
   color: var(--blue);
 }
 
+.detail-tabs button.has-count {
+  border: 1px solid #f7c66d;
+  background: #fff8e8;
+  color: #92400e;
+}
+
+.detail-tabs button.has-count.active {
+  border-color: #4169f4;
+  background: #edf4ff;
+  color: #355fe8;
+}
+
 .detail-content {
   min-height: 0;
   height: 100%;
@@ -2036,11 +2048,58 @@ th.fk svg {
   max-height: calc(100vh - 64px);
 }
 
-.row-modal > div {
+.row-modal header > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.row-modal header span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.row-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.row-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  background: #fff8e8;
+  padding: 10px 14px;
+}
+
+.row-edit-bar span,
+.row-edit-bar strong {
+  color: #92400e;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.row-edit-bar button,
+.row-save-footer button {
+  border-radius: 8px;
+  background: var(--blue);
+  color: #ffffff;
+  font-weight: 600;
+  padding: 8px 12px;
+}
+
+.row-save-footer button:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.row-fields {
   display: grid;
   grid-template-columns: 240px 1fr;
   gap: 1px;
-  max-height: 70vh;
+  max-height: 62vh;
   overflow: auto;
   background: var(--line);
 }
@@ -2049,15 +2108,44 @@ th.fk svg {
   display: contents;
 }
 
-.row-modal span,
-.row-modal code {
+.row-fields span,
+.row-fields code,
+.row-fields textarea {
   background: #ffffff;
   padding: 10px 12px;
 }
 
-.row-modal span {
+.row-fields span {
   color: var(--blue);
   font-weight: 600;
+}
+
+.row-fields textarea {
+  min-height: 42px;
+  border: 0;
+  border-radius: 0;
+  color: var(--ink);
+  font: inherit;
+  outline: 0;
+  resize: vertical;
+}
+
+.row-fields textarea:focus {
+  box-shadow: inset 0 0 0 2px rgb(65 105 244 / 28%);
+}
+
+.row-save-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: flex-end;
+  border-top: 1px solid var(--line);
+  padding: 12px 14px;
+}
+
+.row-save-footer span {
+  color: var(--muted);
+  font-weight: 500;
 }
 
 code {

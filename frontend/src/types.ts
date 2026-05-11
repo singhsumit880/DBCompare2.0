@@ -62,6 +62,20 @@ export type SqlQueryResult = {
   truncated_at?: number;
 };
 
+export type TableColumn = {
+  name: string;
+  type: string;
+  pk: number;
+};
+
+export type RowUpdateResult = {
+  updated_count: number;
+  row: Record<string, unknown> | null;
+  mode: "direct" | "repacked";
+  output_vyp?: string | null;
+  output_vyb?: string | null;
+};
+
 export type ToolRunResult = {
   output_vyp: string;
   output_vyb: string;

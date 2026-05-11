@@ -30,9 +30,10 @@ import {
   sanitizeDatabase,
   startCompareJob,
   tableInfo,
-  tableRows
+  tableRows,
+  updateRow
 } from "./api";
-import type { ComparisonReport, SqlQueryResult, TableDataResult, ToolRunResult } from "./types";
+import type { ComparisonReport, RowUpdateResult, SqlQueryResult, TableColumn, TableDataResult, ToolRunResult } from "./types";
 
 const DEFAULT_EXCLUDES = [
   "kb_fts_vtable",
@@ -64,6 +65,11 @@ type NavigationItem = {
   label: string;
   table: string;
   query?: string;
+};
+
+type SelectedRowState = {
+  row: Record<string, unknown>;
+  key: Record<string, unknown>;
 };
 
 type Screen = "compare" | "sql" | "sanitizer" | "settings" | "fts";
@@ -212,6 +218,20 @@ function fileNameFromPath(filePath: string) {
   return filePath.split(/[\\/]/).pop() || "database-output";
 }
 
+function makeEditableRowKey(row: Record<string, unknown>, columns: TableColumn[], visibleColumns: string[]) {
+  const pkColumns = columns
+    .filter((column) => column.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((column) => column.name)
+    .filter((column) => Object.prototype.hasOwnProperty.call(row, column));
+  const keyColumns = pkColumns.length ? pkColumns : visibleColumns;
+  return Object.fromEntries(keyColumns.map((column) => [column, row[column]]));
+}
+
+function rowMatchesKey(row: Record<string, unknown>, key: Record<string, unknown>) {
+  return Object.entries(key).every(([column, value]) => row[column] === value);
+}
+
 async function pickDatabase(setter: (path: string) => void) {
   const selected = await window.dbcompare?.openDatabase();
   if (selected) setter(selected);
@@ -240,7 +260,7 @@ export function App() {
       <aside className="sidebar">
         <div className="brand-row">
           <div className="brand">
-            <img src="/icon-512.png" alt="" />
+            <img src="./icon-512.png" alt="" />
             {!collapsed && (
               <div>
                 <strong>DB Explorer Pro</strong>
@@ -251,23 +271,23 @@ export function App() {
         </div>
         <nav>
           <button className={screen === "sql" ? "active" : ""} onClick={() => setScreen("sql")}>
-            <img className="menu-icon" src="/menu-icons/open-db.png" alt="" />
+            <img className="menu-icon" src="./menu-icons/open-db.png" alt="" />
             {!collapsed && <span>Open DB</span>}
           </button>
           <button className={screen === "compare" ? "active" : ""} onClick={() => setScreen("compare")}>
-            <img className="menu-icon" src="/menu-icons/db-compare.png" alt="" />
+            <img className="menu-icon" src="./menu-icons/db-compare.png" alt="" />
             {!collapsed && <span>DB Compare</span>}
           </button>
           <button className={screen === "sanitizer" ? "active" : ""} onClick={() => setScreen("sanitizer")}>
-            <img className="menu-icon" src="/menu-icons/db-sanitizer.png" alt="" />
+            <img className="menu-icon" src="./menu-icons/db-sanitizer.png" alt="" />
             {!collapsed && <span>DB Sanitizer</span>}
           </button>
           <button className={screen === "settings" ? "active" : ""} onClick={() => setScreen("settings")}>
-            <img className="menu-icon" src="/menu-icons/setting-repair.png" alt="" />
+            <img className="menu-icon" src="./menu-icons/setting-repair.png" alt="" />
             {!collapsed && <span>Setting Table Repair</span>}
           </button>
           <button className={screen === "fts" ? "active" : ""} onClick={() => setScreen("fts")}>
-            <img className="menu-icon" src="/menu-icons/fts.png" alt="" />
+            <img className="menu-icon" src="./menu-icons/fts.png" alt="" />
             {!collapsed && <span>FTS Table Generator</span>}
           </button>
         </nav>
@@ -998,7 +1018,7 @@ function ComparisonTable({
   onViewMore: (table: TableDataResult) => void;
 }) {
   const [tableFilter, setTableFilter] = useState("");
-  const [changedOnly, setChangedOnly] = useState(false);
+  const [changedOnly, setChangedOnly] = useState(true);
   const visibleTables = tables.filter((table) => {
     const matchesSearch = table.table.toLowerCase().includes(tableFilter.toLowerCase());
     const matchesChange = !changedOnly || hasAnyTableChange(table);
@@ -1032,7 +1052,7 @@ function ComparisonTable({
             <tr>
               <th>Table Name</th>
               <th>Schema Config</th>
-              <th>Rows Modified</th>
+              <th>Data Differences</th>
               <th>DB1 Only</th>
               <th>DB2 Only</th>
               <th>View More Details</th>
@@ -1150,11 +1170,11 @@ function TableDetailModal({
           <button onClick={onClose}>Close</button>
         </header>
         <div className="detail-tabs">
-          <button className={tab === "modified" ? "active" : ""} onClick={() => setTab("modified")}>Modified ({tableCount(table, "modified")})</button>
-          <button className={tab === "db1" ? "active" : ""} onClick={() => setTab("db1")}>DB1 only ({tableCount(table, "db1")})</button>
-          <button className={tab === "db2" ? "active" : ""} onClick={() => setTab("db2")}>DB2 only ({tableCount(table, "db2")})</button>
+          <button className={`${tab === "modified" ? "active" : ""} ${tableCount(table, "modified") > 0 ? "has-count" : ""}`} onClick={() => setTab("modified")}>Modified ({tableCount(table, "modified")})</button>
+          <button className={`${tab === "db1" ? "active" : ""} ${tableCount(table, "db1") > 0 ? "has-count" : ""}`} onClick={() => setTab("db1")}>DB1 only ({tableCount(table, "db1")})</button>
+          <button className={`${tab === "db2" ? "active" : ""} ${tableCount(table, "db2") > 0 ? "has-count" : ""}`} onClick={() => setTab("db2")}>DB2 only ({tableCount(table, "db2")})</button>
           <button className={tab === "complete" ? "active" : ""} onClick={() => setTab("complete")}>Complete Data</button>
-          <button className={tab === "schema" ? "active" : ""} onClick={() => setTab("schema")}>
+          <button className={`${tab === "schema" ? "active" : ""} ${schemaDiffCount(table) > 0 ? "has-count" : ""}`} onClick={() => setTab("schema")}>
             Schema ({schemaDiffCount(table)})
           </button>
         </div>
@@ -1644,6 +1664,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
   const [selectedTable, setSelectedTable] = useState("");
   const [sql, setSql] = useState("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;");
   const [result, setResult] = useState<SqlQueryResult | null>(null);
+  const [tableColumns, setTableColumns] = useState<TableColumn[]>([]);
   const [foreignKeys, setForeignKeys] = useState<{ table: string; from: string; to: string }[]>([]);
   const [status, setStatus] = useState("Load a database to browse tables and run SQL.");
   const [dbVersion, setDbVersion] = useState<number | null>(null);
@@ -1662,7 +1683,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       return [];
     }
   });
-  const [selectedRow, setSelectedRow] = useState<Record<string, unknown> | null>(null);
+  const [selectedRow, setSelectedRow] = useState<SelectedRowState | null>(null);
   const fkByColumn = new Map(foreignKeys.map((fk) => [fk.from, fk]));
   const fkColumns = new Set(fkByColumn.keys());
   const visibleTables = tables.filter((table) => table.toLowerCase().includes(tableFilter.toLowerCase()));
@@ -1743,6 +1764,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     setSelectedTable("");
     setSql("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;");
     setResult(null);
+    setTableColumns([]);
     setForeignKeys([]);
     setStatus("Load a database to browse tables and run SQL.");
     setDbVersion(null);
@@ -1809,6 +1831,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     try {
       const [info, rows] = await Promise.all([tableInfo(dbPath, table), tableRows(dbPath, table, browsePageSize, 0)]);
       setForeignKeys(info.foreign_keys);
+      setTableColumns(info.columns);
       setResult({ columns: rows.columns, rows: rows.rows, row_count: rows.row_count ?? info.row_count });
       setSql(`SELECT * FROM "${table}" LIMIT 250;`);
       setStatus(`${table}: ${info.row_count} row(s), ${info.columns.length} column(s). Loaded ${rows.rows.length}.`);
@@ -1871,6 +1894,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
         executeSql(dbPath, query, false, 250)
       ]);
       setSelectedTable(fk.table);
+      setTableColumns(info.columns);
       setSql(query);
       setNavigationTrail((trail) => {
         const baseTrail = trail.length ? trail : sourceTable ? [{ label: sourceTable, table: sourceTable }] : [];
@@ -1906,6 +1930,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       ]);
       setSelectedTable(item.table);
       setForeignKeys(info.foreign_keys);
+      setTableColumns(info.columns);
       setResult({ columns: data.columns, rows: data.rows, row_count: data.row_count ?? data.rows.length });
       setSql(item.query ?? `SELECT * FROM "${item.table}" LIMIT 250;`);
       setNavigationTrail((trail) => trail.slice(0, index + 1));
@@ -1914,6 +1939,35 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       setResult({ columns: [], rows: [], row_count: 0 });
       setStatus(error instanceof Error ? error.message : "Unable to open breadcrumb item.");
     }
+  }
+
+  async function saveRowEdit(
+    key: Record<string, unknown>,
+    values: Record<string, unknown>
+  ): Promise<RowUpdateResult> {
+    if (!dbPath || !selectedTable) {
+      throw new Error("Select a database table before saving.");
+    }
+
+    const response = await updateRow(dbPath, selectedTable, key, values);
+    const nextRow = response.row ?? { ...(selectedRow?.row ?? {}), ...values };
+    setResult((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        rows: current.rows.map((row) => (rowMatchesKey(row, key) ? nextRow : row))
+      };
+    });
+    setSelectedRow({
+      row: nextRow,
+      key: makeEditableRowKey(nextRow, tableColumns, result?.columns ?? Object.keys(nextRow))
+    });
+    setStatus(
+      response.mode === "repacked"
+        ? "Row edited. Save the generated .vyb copy to keep archive changes."
+        : "Row edited and saved directly."
+    );
+    return response;
   }
 
   return (
@@ -2044,7 +2098,13 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
             tableKey={`${explorerTab}:${selectedTable}`}
             fkColumns={fkColumns}
             fkByColumn={fkByColumn}
-            onOpenRow={setSelectedRow}
+            onOpenRow={(row) => {
+              if (!result) return;
+              setSelectedRow({
+                row,
+                key: makeEditableRowKey(row, tableColumns, result.columns)
+              });
+            }}
             onNavigateForeignKey={navigateForeignKey}
             onLoadMore={loadMoreTableRows}
             canLoadMore={explorerTab === "browse" && Boolean(result && result.rows.length < result.row_count)}
@@ -2053,7 +2113,16 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
         </section>
       </section>
       )}
-      {selectedRow && <RowModal row={selectedRow} onClose={() => setSelectedRow(null)} />}
+      {selectedRow && (
+        <RowModal
+          row={selectedRow.row}
+          rowKey={selectedRow.key}
+          table={selectedTable}
+          canEdit={explorerTab === "browse" && Boolean(selectedTable)}
+          onSave={saveRowEdit}
+          onClose={() => setSelectedRow(null)}
+        />
+      )}
     </>
   );
 }
@@ -2222,22 +2291,122 @@ function ResultTable({
   );
 }
 
-function RowModal({ row, onClose }: { row: Record<string, unknown>; onClose: () => void }) {
+function RowModal({
+  row,
+  rowKey,
+  table,
+  canEdit,
+  onSave,
+  onClose
+}: {
+  row: Record<string, unknown>;
+  rowKey: Record<string, unknown>;
+  table: string;
+  canEdit: boolean;
+  onSave: (key: Record<string, unknown>, values: Record<string, unknown>) => Promise<RowUpdateResult>;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>(() =>
+    Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value === null || value === undefined ? "" : String(value)]))
+  );
+  const [isEditing, setIsEditing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+  const [generatedPath, setGeneratedPath] = useState<string | null>(null);
+
+  const changedValues = useMemo(() => {
+    const values: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(draft)) {
+      const original = row[key];
+      if (value !== (original === null || original === undefined ? "" : String(original))) {
+        values[key] = value;
+      }
+    }
+    return values;
+  }, [draft, row]);
+  const hasChanges = Object.keys(changedValues).length > 0;
+
+  useEffect(() => {
+    setDraft(Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value === null || value === undefined ? "" : String(value)])));
+  }, [row]);
+
+  async function saveChanges() {
+    if (!hasChanges || isSaving) return;
+    setIsSaving(true);
+    setSaveStatus("Saving row");
+    setGeneratedPath(null);
+    try {
+      const response = await onSave(rowKey, changedValues);
+      setSaveStatus(response.mode === "repacked" ? "Edited copy created. Save the new .vyb file." : "Saved directly.");
+      setGeneratedPath(response.output_vyb ?? null);
+      setIsEditing(false);
+    } catch (error) {
+      setSaveStatus(error instanceof Error ? error.message : "Unable to save row.");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function saveGeneratedCopy() {
+    if (!generatedPath || !window.dbcompare?.saveGeneratedFile) return;
+    const result = await window.dbcompare.saveGeneratedFile(generatedPath, fileNameFromPath(generatedPath));
+    if (result.error) {
+      setSaveStatus(result.error);
+    } else if (result.saved && result.path) {
+      setSaveStatus(`Saved copy to ${result.path}`);
+    }
+  }
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section className="row-modal" onClick={(event) => event.stopPropagation()}>
         <header>
-          <strong>Entire Row</strong>
-          <button onClick={onClose}>Close</button>
+          <div>
+            <strong>Entire Row</strong>
+            <span>{table}</span>
+          </div>
+          <div className="row-modal-actions">
+            {canEdit && (
+              <button onClick={() => setIsEditing((value) => !value)}>
+                {isEditing ? "View" : "Edit"}
+              </button>
+            )}
+            <button onClick={onClose}>Close</button>
+          </div>
         </header>
-        <div>
+        {canEdit && (
+          <div className="row-edit-bar">
+            <span>{Object.keys(rowKey).length} key field(s)</span>
+            {saveStatus && <strong>{saveStatus}</strong>}
+            {generatedPath && (
+              <button onClick={saveGeneratedCopy}>Save edited .vyb copy</button>
+            )}
+          </div>
+        )}
+        <div className="row-fields">
           {Object.entries(row).map(([key, value]) => (
             <label key={key}>
               <span>{key}</span>
-              <code>{valueText(value)}</code>
+              {isEditing ? (
+                <textarea
+                  value={draft[key] ?? ""}
+                  onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))}
+                  spellCheck={false}
+                />
+              ) : (
+                <code>{valueText(value)}</code>
+              )}
             </label>
           ))}
         </div>
+        {isEditing && (
+          <footer className="row-save-footer">
+            <button disabled={!hasChanges || isSaving} onClick={saveChanges}>
+              {isSaving ? "Saving..." : "Save changes"}
+            </button>
+            <span>{hasChanges ? `${Object.keys(changedValues).length} field(s) changed` : "No changes"}</span>
+          </footer>
+        )}
       </section>
     </div>
   );

@@ -2,7 +2,7 @@
   "name": "db-explorer-pro",
   "version": "0.1.0",
   "private": true,
-  "description": "Modern desktop UI for DB Explorer Pro",
+  "description": "DB Explorer Pro",
   "main": "electron/main.cjs",
   "scripts": {
     "backend": "python backend/run.py",
@@ -23,11 +23,11 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "lucide-react": "^0.468.0",
-    "electron": "^33.0.0",
     "concurrently": "^9.0.0",
     "wait-on": "^8.0.0"
   },
   "devDependencies": {
+    "electron": "^33.0.0",
     "electron-builder": "^25.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
@@ -37,8 +37,10 @@
     "appId": "com.dbexplorerpro.desktop",
     "productName": "DB Explorer Pro",
     "directories": {
+      "buildResources": "electron/assets",
       "output": "release"
     },
+    "executableName": "DB Explorer Pro",
     "files": [
       "dist/**",
       "electron/**",
@@ -62,8 +64,9 @@
           "sqlite",
           "sqlite3"
         ],
-        "name": "Database File",
+        "name": "DB Explorer Pro Database",
         "description": "Open database with DB Explorer Pro",
+        "icon": "icon.ico",
         "role": "Viewer"
       }
     ],
@@ -72,13 +75,14 @@
         "nsis",
         "portable"
       ],
-      "icon": "electron/assets/icon.ico"
+      "signAndEditExecutable": false,
+      "icon": "icon.ico"
     },
     "mac": {
       "target": [
         "dmg"
       ],
-      "icon": "electron/assets/icon.icns",
+      "icon": "icon.icns",
       "category": "public.app-category.developer-tools"
     }
   }

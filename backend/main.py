@@ -7,12 +7,14 @@ reimplementing database behavior in the frontend.
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import asyncio
 import threading
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,7 +30,7 @@ from core.db_io import extract_database_file, is_valid_sqlite
 from core.fts_builder import process_fts
 from core.sanitizer import convert_file, process_sanitization
 from core.settings_repair import process_settings_repair
-from core.utils import cleanup_dir
+from core.utils import cleanup_dir, get_temp_dir, zip_vyp
 
 
 app = FastAPI(title="DBCompare 2.0 API", version="0.1.0")
@@ -69,6 +71,10 @@ class QueryRequest(DatabasePathRequest):
 
 class RowRequest(TableRequest):
     key: dict[str, Any]
+
+
+class RowUpdateRequest(RowRequest):
+    values: dict[str, Any]
 
 
 class RelatedRowRequest(TableRequest):
@@ -194,6 +200,51 @@ def _foreign_keys(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: _jsonable(row[key]) for key in row.keys()}
+
+
+def _apply_row_update(db_file: str, table_name: str, key: dict[str, Any], values: dict[str, Any]) -> int:
+    if not key:
+        raise ValueError("Row key is required")
+    if not values:
+        raise ValueError("No values were changed")
+
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        table_columns = {column["name"] for column in _table_columns(conn, table_name)}
+        invalid_key_columns = [column for column in key if column not in table_columns]
+        invalid_value_columns = [column for column in values if column not in table_columns]
+        if invalid_key_columns or invalid_value_columns:
+            invalid = ", ".join(invalid_key_columns + invalid_value_columns)
+            raise ValueError(f"Unknown column(s): {invalid}")
+
+        set_clause = ", ".join(f"{_quote_identifier(column)} = ?" for column in values)
+        where_parts: list[str] = []
+        where_values: list[Any] = []
+        for column, value in key.items():
+            if value is None:
+                where_parts.append(f"{_quote_identifier(column)} IS NULL")
+            else:
+                where_parts.append(f"{_quote_identifier(column)} = ?")
+                where_values.append(value)
+        where_clause = " AND ".join(where_parts)
+        match_count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {_quote_identifier(table_name)} WHERE {where_clause}",
+            where_values,
+        ).fetchone()["c"]
+        if match_count != 1:
+            raise ValueError(f"Expected row key to match 1 row, matched {match_count}")
+
+        sql = f"UPDATE {_quote_identifier(table_name)} SET {set_clause} WHERE {where_clause}"
+        cursor = conn.execute(sql, [*values.values(), *where_values])
+        conn.commit()
+        return cursor.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @app.get("/health")
@@ -533,6 +584,59 @@ def get_row(request: RowRequest) -> dict[str, Any]:
         sql = f"SELECT * FROM {_quote_identifier(request.table)} WHERE {where} LIMIT 1"
         row = conn.execute(sql, values).fetchone()
         return {"row": _row_to_dict(row) if row else None}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if conn:
+            conn.close()
+        if resolved:
+            resolved.close()
+
+
+@app.post("/api/sql/update-row")
+def update_row(request: RowUpdateRequest) -> dict[str, Any]:
+    resolved = conn = None
+    try:
+        source_ext = os.path.splitext(request.db_path)[1].lower()
+        resolved = ResolvedDatabase(request.db_path)
+        updated_count = _apply_row_update(resolved.path, request.table, request.key, request.values)
+        if updated_count != 1:
+            raise ValueError(f"Expected to update 1 row, updated {updated_count}")
+
+        output_vyb = None
+        output_vyp = None
+        if source_ext == ".vyb":
+            temp_dir = get_temp_dir("temp_edit")
+            base = os.path.splitext(os.path.basename(request.db_path))[0]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_vyp = os.path.join(temp_dir, f"edited_{base}_{timestamp}.vyp")
+            output_vyb = os.path.join(temp_dir, f"edited_{base}_{timestamp}.vyb")
+            shutil.copy(resolved.path, output_vyp)
+            zip_vyp(output_vyp, output_vyb)
+
+        conn = sqlite3.connect(resolved.path)
+        conn.row_factory = sqlite3.Row
+        where_parts: list[str] = []
+        where_values: list[Any] = []
+        lookup_key = {**request.key, **request.values}
+        for column, value in lookup_key.items():
+            if value is None:
+                where_parts.append(f"{_quote_identifier(column)} IS NULL")
+            else:
+                where_parts.append(f"{_quote_identifier(column)} = ?")
+                where_values.append(value)
+        row = conn.execute(
+            f"SELECT * FROM {_quote_identifier(request.table)} WHERE {' AND '.join(where_parts)} LIMIT 1",
+            where_values,
+        ).fetchone()
+
+        return {
+            "updated_count": updated_count,
+            "row": _row_to_dict(row) if row else None,
+            "mode": "repacked" if output_vyb else "direct",
+            "output_vyp": output_vyp,
+            "output_vyb": output_vyb,
+        }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
