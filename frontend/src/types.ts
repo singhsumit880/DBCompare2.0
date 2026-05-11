@@ -5,6 +5,12 @@ export type TableDataResult = {
   rows_only_in_db2: Record<string, unknown>[];
   all_db1_rows?: Record<string, unknown>[];
   all_db2_rows?: Record<string, unknown>[];
+  rows_only_in_db1_count?: number;
+  rows_only_in_db2_count?: number;
+  modified_rows_count?: number;
+  all_db1_rows_count?: number;
+  all_db2_rows_count?: number;
+  result_limited?: boolean;
   modified_rows: {
     pk: Record<string, unknown>;
     column_changes: [string, unknown, unknown][];
@@ -37,6 +43,18 @@ export type ComparisonReport = {
   db2_label: string;
 };
 
+export type CompareJobStatus = {
+  id: string;
+  status: "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed";
+  message: string;
+  percent: number;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  error: string | null;
+  has_result: boolean;
+};
+
 export type SqlQueryResult = {
   columns: string[];
   rows: Record<string, unknown>[];
@@ -63,6 +81,8 @@ declare global {
         defaultName?: string
       ) => Promise<{ saved: boolean; path?: string; error?: string }>;
       apiBaseUrl: string;
+      initialOpenFile?: string;
+      backendStatus: () => Promise<{ ok: boolean; apiBaseUrl: string; error?: string | null }>;
     };
   }
 }

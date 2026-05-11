@@ -53,6 +53,20 @@
         ]
       }
     ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "vyp",
+          "vyb",
+          "db",
+          "sqlite",
+          "sqlite3"
+        ],
+        "name": "Database File",
+        "description": "Open database with DB Explorer Pro",
+        "role": "Viewer"
+      }
+    ],
     "win": {
       "target": [
         "nsis",

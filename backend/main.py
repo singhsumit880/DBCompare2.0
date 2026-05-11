@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import asyncio
+import threading
+import time
+import uuid
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -31,7 +35,7 @@ app = FastAPI(title="DBCompare 2.0 API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "null"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,6 +50,7 @@ class CompareRequest(BaseModel):
     ignore_datetime: bool = True
     decimal_precision: int = DEFAULT_DECIMAL_PRECISION
     validate_db: bool = True
+    max_result_rows_per_table: int = 500
 
 
 class DatabasePathRequest(BaseModel):
@@ -74,6 +79,41 @@ class RelatedRowRequest(TableRequest):
 
 class SanitizeRequest(DatabasePathRequest):
     queries: list[str] = Field(default_factory=list)
+
+
+compare_jobs: dict[str, dict[str, Any]] = {}
+compare_jobs_lock = threading.Lock()
+COMPARE_JOB_TTL_SECONDS = 60 * 60
+
+
+def _run_compare(request: CompareRequest, cancel_event: threading.Event, progress: Any | None = None) -> dict[str, Any]:
+    comparator = DatabaseComparator()
+    if progress:
+        comparator.set_progress(progress)
+    report = comparator.compare(
+        request.db1_path,
+        request.db2_path,
+        included_tables=set(request.included_tables),
+        excluded_tables=set(request.excluded_tables),
+        ignore_datetime=request.ignore_datetime,
+        decimal_precision=request.decimal_precision,
+        validate_db=request.validate_db,
+        max_result_rows_per_table=request.max_result_rows_per_table,
+        cancel_check=cancel_event.is_set,
+    )
+    return _jsonable(report)
+
+
+def _cleanup_compare_jobs() -> None:
+    cutoff = time.time() - COMPARE_JOB_TTL_SECONDS
+    with compare_jobs_lock:
+        stale_ids = [
+            job_id
+            for job_id, job in compare_jobs.items()
+            if job.get("finished_at") and job["finished_at"] < cutoff
+        ]
+        for job_id in stale_ids:
+            compare_jobs.pop(job_id, None)
 
 
 def _jsonable(value: Any) -> Any:
@@ -162,21 +202,134 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/compare")
-def compare_databases(request: CompareRequest) -> dict[str, Any]:
-    comparator = DatabaseComparator()
+async def compare_databases(request: CompareRequest, http_request: Request) -> dict[str, Any]:
+    cancel_event = threading.Event()
+
+    async def watch_disconnect() -> None:
+        while not cancel_event.is_set():
+            if await http_request.is_disconnected():
+                cancel_event.set()
+                return
+            await asyncio.sleep(0.25)
+
+    watcher = asyncio.create_task(watch_disconnect())
     try:
-        report = comparator.compare(
-            request.db1_path,
-            request.db2_path,
-            included_tables=set(request.included_tables),
-            excluded_tables=set(request.excluded_tables),
-            ignore_datetime=request.ignore_datetime,
-            decimal_precision=request.decimal_precision,
-            validate_db=request.validate_db,
-        )
-        return _jsonable(report)
+        return await asyncio.to_thread(_run_compare, request, cancel_event)
+    except InterruptedError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        cancel_event.set()
+        watcher.cancel()
+
+
+@app.post("/api/compare/jobs")
+def start_compare_job(request: CompareRequest) -> dict[str, str]:
+    _cleanup_compare_jobs()
+    job_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "message": "Queued",
+        "percent": 0,
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "result": None,
+        "error": None,
+        "cancel_event": cancel_event,
+    }
+
+    def update_progress(message: str, percent: int | None = None) -> None:
+        with compare_jobs_lock:
+            current = compare_jobs.get(job_id)
+            if not current:
+                return
+            current["message"] = message
+            if percent is not None:
+                current["percent"] = max(0, min(100, int(percent)))
+
+    def worker() -> None:
+        with compare_jobs_lock:
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            job["message"] = "Starting comparison"
+            job["percent"] = 1
+        try:
+            result = _run_compare(request, cancel_event, update_progress)
+            with compare_jobs_lock:
+                job["status"] = "completed"
+                job["message"] = "Comparison complete"
+                job["percent"] = 100
+                job["result"] = result
+                job["finished_at"] = time.time()
+        except InterruptedError:
+            with compare_jobs_lock:
+                job["status"] = "cancelled"
+                job["message"] = "Comparison cancelled"
+                job["finished_at"] = time.time()
+        except Exception as exc:
+            with compare_jobs_lock:
+                job["status"] = "failed"
+                job["message"] = "Comparison failed"
+                job["error"] = str(exc)
+                job["finished_at"] = time.time()
+
+    with compare_jobs_lock:
+        compare_jobs[job_id] = job
+
+    thread = threading.Thread(target=worker, name=f"compare-{job_id}", daemon=True)
+    thread.start()
+    return {"job_id": job_id}
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "message": job["message"],
+        "percent": job["percent"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "error": job["error"],
+        "has_result": job["result"] is not None,
+    }
+
+
+@app.get("/api/compare/jobs/{job_id}")
+def get_compare_job(job_id: str) -> dict[str, Any]:
+    with compare_jobs_lock:
+        job = compare_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Compare job not found")
+        return _public_job(job)
+
+
+@app.get("/api/compare/jobs/{job_id}/result")
+def get_compare_job_result(job_id: str) -> dict[str, Any]:
+    with compare_jobs_lock:
+        job = compare_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Compare job not found")
+        if job["status"] != "completed":
+            raise HTTPException(status_code=409, detail=f"Compare job is {job['status']}")
+        return job["result"]
+
+
+@app.post("/api/compare/jobs/{job_id}/cancel")
+def cancel_compare_job(job_id: str) -> dict[str, Any]:
+    with compare_jobs_lock:
+        job = compare_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Compare job not found")
+        job["cancel_event"].set()
+        if job["status"] in {"queued", "running"}:
+            job["status"] = "cancelling"
+            job["message"] = "Cancelling comparison"
+        return _public_job(job)
 
 
 @app.post("/api/tools/sanitize")
@@ -351,11 +504,13 @@ def table_rows(request: TableRequest, limit: int = 250, offset: int = 0) -> dict
     try:
         resolved, conn = _connect_resolved(request.db_path)
         table = _quote_identifier(request.table)
+        count = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
         rows = conn.execute(f"SELECT * FROM {table} LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         return {
             "table": request.table,
             "columns": [desc[0] for desc in conn.execute(f"SELECT * FROM {table} LIMIT 0").description],
             "rows": [_row_to_dict(row) for row in rows],
+            "row_count": count,
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

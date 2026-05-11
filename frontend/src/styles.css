@@ -702,6 +702,22 @@ tbody tr.clean td {
   color: var(--muted);
 }
 
+.progress-track {
+  width: min(360px, 72vw);
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dce6f5;
+}
+
+.progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--purple));
+  transition: width 0.2s ease;
+}
+
 .compare-overlay button {
   border-radius: 999px;
   background: #fff1f2;

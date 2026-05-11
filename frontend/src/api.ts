@@ -1,4 +1,4 @@
-import type { ComparisonReport, SqlQueryResult, ToolRunResult } from "./types";
+import type { CompareJobStatus, ComparisonReport, SqlQueryResult, ToolRunResult } from "./types";
 
 const baseUrl = window.dbcompare?.apiBaseUrl ?? "http://127.0.0.1:8765";
 
@@ -18,6 +18,15 @@ async function post<T>(path: string, body: unknown, signal?: AbortSignal): Promi
   return response.json() as Promise<T>;
 }
 
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, { signal });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? response.statusText);
+  }
+  return response.json() as Promise<T>;
+}
+
 export function compareDatabases(payload: {
   db1_path: string;
   db2_path: string;
@@ -26,8 +35,27 @@ export function compareDatabases(payload: {
   ignore_datetime: boolean;
   decimal_precision: number;
   validate_db: boolean;
+  max_result_rows_per_table?: number;
 }, signal?: AbortSignal) {
   return post<ComparisonReport>("/api/compare", payload, signal);
+}
+
+export type ComparePayload = Parameters<typeof compareDatabases>[0];
+
+export function startCompareJob(payload: ComparePayload, signal?: AbortSignal) {
+  return post<{ job_id: string }>("/api/compare/jobs", payload, signal);
+}
+
+export function getCompareJob(jobId: string, signal?: AbortSignal) {
+  return get<CompareJobStatus>(`/api/compare/jobs/${jobId}`, signal);
+}
+
+export function getCompareJobResult(jobId: string, signal?: AbortSignal) {
+  return get<ComparisonReport>(`/api/compare/jobs/${jobId}/result`, signal);
+}
+
+export function cancelCompareJob(jobId: string) {
+  return post<CompareJobStatus>(`/api/compare/jobs/${jobId}/cancel`, {});
 }
 
 export function sanitizeDatabase(dbPath: string, queries: string[]) {
@@ -72,7 +100,7 @@ export function databaseVersion(dbPath: string) {
 }
 
 export function tableRows(dbPath: string, table: string, limit = 1000, offset = 0) {
-  return post<{ table: string; columns: string[]; rows: Record<string, unknown>[] }>(
+  return post<{ table: string; columns: string[]; rows: Record<string, unknown>[]; row_count: number }>(
     `/api/sql/rows?limit=${limit}&offset=${offset}`,
     { db_path: dbPath, table }
   );

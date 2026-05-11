@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import {
   AlertTriangle,
   ArrowLeftToLine,
@@ -18,14 +18,17 @@ import {
 } from "lucide-react";
 import {
   buildFtsDatabase,
-  compareDatabases,
+  cancelCompareJob,
   convertDatabase,
   databaseChecks,
   databaseVersion,
   executeSql,
+  getCompareJob,
+  getCompareJobResult,
   listTables,
   repairSettingsTable,
   sanitizeDatabase,
+  startCompareJob,
   tableInfo,
   tableRows
 } from "./api";
@@ -186,7 +189,7 @@ function toggleListValue(values: string[], value: string) {
 }
 
 function changedCount(table: TableDataResult) {
-  return table.modified_rows.length + table.rows_only_in_db1.length + table.rows_only_in_db2.length;
+  return tableCount(table, "modified") + tableCount(table, "db1") + tableCount(table, "db2");
 }
 
 function hasAnyTableChange(table: TableDataResult) {
@@ -199,6 +202,12 @@ function schemaDiffCount(table: TableDataResult) {
   return diff.only_in_db1.length + diff.only_in_db2.length;
 }
 
+function tableCount(table: TableDataResult, kind: "modified" | "db1" | "db2") {
+  if (kind === "modified") return table.modified_rows_count ?? table.modified_rows.length;
+  if (kind === "db1") return table.rows_only_in_db1_count ?? table.rows_only_in_db1.length;
+  return table.rows_only_in_db2_count ?? table.rows_only_in_db2.length;
+}
+
 function fileNameFromPath(filePath: string) {
   return filePath.split(/[\\/]/).pop() || "database-output";
 }
@@ -208,12 +217,23 @@ async function pickDatabase(setter: (path: string) => void) {
   if (selected) setter(selected);
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function App() {
   const [screen, setScreen] = useState<Screen>("sql");
   const [collapsed, setCollapsed] = useState(false);
   const [db1, setDb1] = useState("");
   const [db2, setDb2] = useState("");
   const [activeDb, setActiveDb] = useState("");
+
+  useEffect(() => {
+    const launchFile = window.dbcompare?.initialOpenFile;
+    if (!launchFile) return;
+    setActiveDb(launchFile);
+    setScreen("sql");
+  }, []);
 
   return (
     <main className={`app-shell ${collapsed ? "nav-collapsed" : ""}`}>
@@ -742,14 +762,20 @@ function CompareWorkspace({
   const [compareStartedAt, setCompareStartedAt] = useState<number | null>(null);
   const [compareDuration, setCompareDuration] = useState<number | null>(null);
   const [compareController, setCompareController] = useState<AbortController | null>(null);
+  const [compareJobId, setCompareJobId] = useState<string | null>(null);
+  const [compareProgress, setCompareProgress] = useState({ message: "", percent: 0 });
 
   const tableResults = useMemo(() => report?.data ?? [], [report]);
   const affectedTables = tableResults.filter(hasAnyTableChange);
   const totalRowChanges = tableResults.reduce((sum, table) => sum + changedCount(table), 0);
 
-  function cancelCompare() {
+  async function cancelCompare() {
     compareController?.abort();
+    if (compareJobId) {
+      await cancelCompareJob(compareJobId).catch(() => null);
+    }
     setIsComparing(false);
+    setCompareJobId(null);
     setStatus("Comparison cancelled");
   }
 
@@ -768,6 +794,8 @@ function CompareWorkspace({
     setCompareStartedAt(null);
     setCompareDuration(null);
     setCompareController(null);
+    setCompareJobId(null);
+    setCompareProgress({ message: "", percent: 0 });
     setStatus("Ready");
   }
 
@@ -782,18 +810,43 @@ function CompareWorkspace({
     setCompareStartedAt(started);
     setCompareDuration(null);
     setIsComparing(true);
-    setStatus("Comparing databases");
+    setCompareProgress({ message: "Starting comparison", percent: 0 });
+    setStatus("Starting comparison");
     setDetailTable(null);
     try {
-      const nextReport = await compareDatabases({
+      const payload = {
         db1_path: db1,
         db2_path: db2,
         included_tables: splitCsv(include),
         excluded_tables: excludedTables,
         ignore_datetime: ignoreDates,
         decimal_precision: precision,
-        validate_db: validate
-      }, controller.signal);
+        validate_db: validate,
+        max_result_rows_per_table: 500
+      };
+      const { job_id: jobId } = await startCompareJob(payload, controller.signal);
+      setCompareJobId(jobId);
+
+      let completed = false;
+      while (!completed) {
+        await sleep(500);
+        if (controller.signal.aborted) {
+          await cancelCompareJob(jobId).catch(() => null);
+          throw new DOMException("Comparison cancelled", "AbortError");
+        }
+        const job = await getCompareJob(jobId, controller.signal);
+        setCompareProgress({ message: job.message, percent: job.percent });
+        setStatus(`${job.message}${job.percent ? ` (${job.percent}%)` : ""}`);
+        if (job.status === "completed") {
+          completed = true;
+        } else if (job.status === "cancelled") {
+          throw new DOMException("Comparison cancelled", "AbortError");
+        } else if (job.status === "failed") {
+          throw new Error(job.error || job.message || "Comparison failed");
+        }
+      }
+
+      const nextReport = await getCompareJobResult(jobId, controller.signal);
       const seconds = (performance.now() - started) / 1000;
       setReport(nextReport);
       setCompareDuration(seconds);
@@ -811,6 +864,7 @@ function CompareWorkspace({
     } finally {
       setIsComparing(false);
       setCompareController(null);
+      setCompareJobId(null);
     }
   }
 
@@ -880,7 +934,10 @@ function CompareWorkspace({
       {isComparing && (
         <div className="compare-overlay">
           <div className="compare-loader" />
-          <strong>Comparing databases</strong>
+          <strong>{compareProgress.message || "Comparing databases"}</strong>
+          <div className="progress-track">
+            <span style={{ width: `${compareProgress.percent}%` }} />
+          </div>
           <span>{compareStartedAt ? `${((performance.now() - compareStartedAt) / 1000).toFixed(1)}s elapsed` : "Working"}</span>
           <button onClick={cancelCompare}>Cancel</button>
         </div>
@@ -991,9 +1048,9 @@ function ComparisonTable({
                   <td className={schemaDiffers ? "warn" : "ok"}>
                     {schemaDiffers ? `Differs (${schemaDiffCount(table)})` : "Match"}
                   </td>
-                  <td>{table.modified_rows.length || "-"}</td>
-                  <td>{table.rows_only_in_db1.length || "-"}</td>
-                  <td>{table.rows_only_in_db2.length || "-"}</td>
+                  <td>{tableCount(table, "modified") || "-"}</td>
+                  <td>{tableCount(table, "db1") || "-"}</td>
+                  <td>{tableCount(table, "db2") || "-"}</td>
                   <td>
                     {(rowChanges || schemaDiffers) ? (
                       <button className="link-button" onClick={() => onViewMore(table)}>
@@ -1079,7 +1136,7 @@ function TableDetailModal({
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<DetailTab>(
-    table.modified_rows.length ? "modified" : table.rows_only_in_db1.length ? "db1" : table.rows_only_in_db2.length ? "db2" : "schema"
+    tableCount(table, "modified") ? "modified" : tableCount(table, "db1") ? "db1" : tableCount(table, "db2") ? "db2" : "schema"
   );
 
   return (
@@ -1093,9 +1150,9 @@ function TableDetailModal({
           <button onClick={onClose}>Close</button>
         </header>
         <div className="detail-tabs">
-          <button className={tab === "modified" ? "active" : ""} onClick={() => setTab("modified")}>Modified ({table.modified_rows.length})</button>
-          <button className={tab === "db1" ? "active" : ""} onClick={() => setTab("db1")}>DB1 only ({table.rows_only_in_db1.length})</button>
-          <button className={tab === "db2" ? "active" : ""} onClick={() => setTab("db2")}>DB2 only ({table.rows_only_in_db2.length})</button>
+          <button className={tab === "modified" ? "active" : ""} onClick={() => setTab("modified")}>Modified ({tableCount(table, "modified")})</button>
+          <button className={tab === "db1" ? "active" : ""} onClick={() => setTab("db1")}>DB1 only ({tableCount(table, "db1")})</button>
+          <button className={tab === "db2" ? "active" : ""} onClick={() => setTab("db2")}>DB2 only ({tableCount(table, "db2")})</button>
           <button className={tab === "complete" ? "active" : ""} onClick={() => setTab("complete")}>Complete Data</button>
           <button className={tab === "schema" ? "active" : ""} onClick={() => setTab("schema")}>
             Schema ({schemaDiffCount(table)})
@@ -1123,6 +1180,7 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
   } | null>(null);
   const selected = table.modified_rows[selectedIndex] ?? table.modified_rows[0];
   const totalFieldChanges = table.modified_rows.reduce((sum, row) => sum + row.column_changes.length, 0);
+  const modifiedTotal = tableCount(table, "modified");
 
   const rowSummaries = table.modified_rows.map((row, index) => ({
     index,
@@ -1146,9 +1204,10 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
   return (
     <div className="modified-workspace">
       <div className="diff-summary-strip">
-        <span>{table.modified_rows.length} modified row(s)</span>
+        <span>{modifiedTotal} modified row(s)</span>
         <span>{totalFieldChanges} changed field(s)</span>
         <span>{selected ? `${selected.column_changes.length} in selected row` : "No row selected"}</span>
+        {table.result_limited && <span>Showing first {table.modified_rows.length} sampled row(s)</span>}
       </div>
 
       <label className="diff-filter">
@@ -1248,8 +1307,8 @@ function CompleteDataView({
 
     async function loadCompleteRows() {
       if ((table.all_db1_rows?.length || table.all_db2_rows?.length) && !cancelled) {
-        setDb1Total(table.all_db1_rows?.length ?? 0);
-        setDb2Total(table.all_db2_rows?.length ?? 0);
+        setDb1Total(table.all_db1_rows_count ?? table.all_db1_rows?.length ?? 0);
+        setDb2Total(table.all_db2_rows_count ?? table.all_db2_rows?.length ?? 0);
         setLoadStatus("Showing complete data from comparison result");
         return;
       }
@@ -1304,9 +1363,9 @@ function CompleteDataView({
       <div className="diff-summary-strip">
         <span>DB1: {db1Total ?? db1Rows.length} row(s)</span>
         <span>DB2: {db2Total ?? db2Rows.length} row(s)</span>
-        <span>{table.modified_rows.length} modified</span>
-        <span>{table.rows_only_in_db1.length} DB1 only</span>
-        <span>{table.rows_only_in_db2.length} DB2 only</span>
+        <span>{tableCount(table, "modified")} modified</span>
+        <span>{tableCount(table, "db1")} DB1 only</span>
+        <span>{tableCount(table, "db2")} DB2 only</span>
         <span>{loadStatus}</span>
       </div>
 
@@ -1580,6 +1639,7 @@ function NoData({ message = "No data available" }: { message?: string }) {
 }
 
 function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: string) => void }) {
+  const browsePageSize = 1000;
   const [tables, setTables] = useState<string[]>([]);
   const [selectedTable, setSelectedTable] = useState("");
   const [sql, setSql] = useState("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;");
@@ -1594,6 +1654,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
   const [tableFilter, setTableFilter] = useState("");
   const [explorerTab, setExplorerTab] = useState<"browse" | "query">("browse");
   const [navigationTrail, setNavigationTrail] = useState<NavigationItem[]>([]);
+  const [isLoadingMoreRows, setIsLoadingMoreRows] = useState(false);
   const [queryHistory, setQueryHistory] = useState<string[]>(() => {
     try {
       return JSON.parse(localStorage.getItem("dbcompare.queryHistory") ?? "[]");
@@ -1693,6 +1754,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     setExplorerTab("browse");
     setNavigationTrail([]);
     setSelectedRow(null);
+    setIsLoadingMoreRows(false);
   }
 
   async function runDatabaseCheck(kind: "integrity" | "foreign") {
@@ -1745,13 +1807,37 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     }
     setStatus(`Opening ${table}`);
     try {
-      const [info, rows] = await Promise.all([tableInfo(dbPath, table), tableRows(dbPath, table)]);
+      const [info, rows] = await Promise.all([tableInfo(dbPath, table), tableRows(dbPath, table, browsePageSize, 0)]);
       setForeignKeys(info.foreign_keys);
-      setResult({ columns: rows.columns, rows: rows.rows, row_count: rows.rows.length });
+      setResult({ columns: rows.columns, rows: rows.rows, row_count: rows.row_count ?? info.row_count });
       setSql(`SELECT * FROM "${table}" LIMIT 250;`);
-      setStatus(`${table}: ${info.row_count} row(s), ${info.columns.length} column(s).`);
+      setStatus(`${table}: ${info.row_count} row(s), ${info.columns.length} column(s). Loaded ${rows.rows.length}.`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Unable to inspect table.");
+    }
+  }
+
+  async function loadMoreTableRows() {
+    if (!dbPath || !selectedTable || explorerTab !== "browse" || !result || isLoadingMoreRows) return;
+    if (result.rows.length >= result.row_count) return;
+    const table = selectedTable;
+    const offset = result.rows.length;
+    setIsLoadingMoreRows(true);
+    try {
+      const data = await tableRows(dbPath, table, browsePageSize, offset);
+      setResult((current) => {
+        if (!current || selectedTable !== table) return current;
+        return {
+          columns: data.columns.length ? data.columns : current.columns,
+          rows: [...current.rows, ...data.rows],
+          row_count: data.row_count ?? current.row_count
+        };
+      });
+      setStatus(`${table}: loaded ${Math.min(offset + data.rows.length, data.row_count)} of ${data.row_count} row(s).`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Unable to load more rows.");
+    } finally {
+      setIsLoadingMoreRows(false);
     }
   }
 
@@ -1791,7 +1877,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
         return [...baseTrail, { label: `${fk.table} (${fk.to}=${valueText(value)})`, table: fk.table, query }];
       });
       setForeignKeys(info.foreign_keys);
-      setResult({ columns: data.columns, rows: data.rows, row_count: data.rows.length });
+      setResult({ columns: data.columns, rows: data.rows, row_count: data.row_count });
       rememberQuery(query);
       setStatus(`${data.rows.length} related row(s) found in ${fk.table} for ${fk.to} = ${valueText(value)}.`);
     } catch (error) {
@@ -1816,11 +1902,11 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     try {
       const [info, data] = await Promise.all([
         tableInfo(dbPath, item.table),
-        item.query ? executeSql(dbPath, item.query, false, 250) : tableRows(dbPath, item.table)
+        item.query ? executeSql(dbPath, item.query, false, 250) : tableRows(dbPath, item.table, browsePageSize, 0)
       ]);
       setSelectedTable(item.table);
       setForeignKeys(info.foreign_keys);
-      setResult({ columns: data.columns, rows: data.rows, row_count: data.rows.length });
+      setResult({ columns: data.columns, rows: data.rows, row_count: data.row_count ?? data.rows.length });
       setSql(item.query ?? `SELECT * FROM "${item.table}" LIMIT 250;`);
       setNavigationTrail((trail) => trail.slice(0, index + 1));
       setStatus(`${item.label}: ${data.rows.length} row(s).`);
@@ -1925,7 +2011,11 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
             </>
           ) : (
             <div className="browse-heading compact">
-              <span>{selectedTable ? `${selectedTable} - ${result?.row_count ?? 0} row(s)` : "Select a table"}</span>
+              <span>
+                {selectedTable
+                  ? `${selectedTable} - ${result?.row_count ?? 0} row(s)${result ? `, loaded ${result.rows.length}` : ""}`
+                  : "Select a table"}
+              </span>
             </div>
           )}
           {navigationTrail.length > 1 && (
@@ -1951,10 +2041,14 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
           {explorerTab === "query" && <div className="sql-status">{status}</div>}
           <ResultTable
             result={result}
+            tableKey={`${explorerTab}:${selectedTable}`}
             fkColumns={fkColumns}
             fkByColumn={fkByColumn}
             onOpenRow={setSelectedRow}
             onNavigateForeignKey={navigateForeignKey}
+            onLoadMore={loadMoreTableRows}
+            canLoadMore={explorerTab === "browse" && Boolean(result && result.rows.length < result.row_count)}
+            isLoadingMore={isLoadingMoreRows}
           />
         </section>
       </section>
@@ -1966,19 +2060,29 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
 
 function ResultTable({
   result,
+  tableKey,
   fkColumns,
   fkByColumn,
   onOpenRow,
-  onNavigateForeignKey
+  onNavigateForeignKey,
+  onLoadMore,
+  canLoadMore = false,
+  isLoadingMore = false
 }: {
   result: SqlQueryResult | null;
+  tableKey: string;
   fkColumns: Set<string>;
   fkByColumn: Map<string, { table: string; from: string; to: string }>;
   onOpenRow: (row: Record<string, unknown>) => void;
   onNavigateForeignKey: (fk: { table: string; from: string; to: string }, value: unknown) => void;
+  onLoadMore?: () => void;
+  canLoadMore?: boolean;
+  isLoadingMore?: boolean;
 }) {
+  const renderStep = 300;
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [sort, setSort] = useState<{ column: string; direction: "asc" | "desc" } | null>(null);
+  const [renderLimit, setRenderLimit] = useState(renderStep);
 
   const visibleRows = useMemo(() => {
     if (!result) return [];
@@ -2002,6 +2106,12 @@ function ResultTable({
     });
   }, [filters, result, sort]);
 
+  useEffect(() => {
+    setRenderLimit(renderStep);
+  }, [filters, sort, tableKey]);
+
+  const renderedRows = visibleRows.slice(0, renderLimit);
+
   function toggleSort(column: string) {
     setSort((current) => {
       if (!current || current.column !== column) return { column, direction: "asc" };
@@ -2010,10 +2120,23 @@ function ResultTable({
     });
   }
 
+  function handleScroll(event: UIEvent<HTMLDivElement>) {
+    const target = event.currentTarget;
+    const nearBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 120;
+    if (!nearBottom) return;
+    if (visibleRows.length > renderLimit) {
+      setRenderLimit((current) => Math.min(current + renderStep, visibleRows.length));
+      return;
+    }
+    if (canLoadMore && !isLoadingMore) {
+      onLoadMore?.();
+    }
+  }
+
   if (!result) return <div className="muted-block">No query result</div>;
 
   return (
-    <div className="data-table">
+    <div className="data-table" onScroll={handleScroll}>
       <table>
         <thead>
           <tr>
@@ -2041,7 +2164,7 @@ function ResultTable({
           </tr>
         </thead>
         <tbody>
-          {visibleRows.map((row, rowIndex) => (
+          {renderedRows.map((row, rowIndex) => (
             <tr key={rowIndex} onClick={() => onOpenRow(row)}>
               {result.columns.map((column) => {
                 const fk = fkByColumn.get(column);
@@ -2073,6 +2196,23 @@ function ResultTable({
             <tr>
               <td colSpan={result.columns.length || 1} className="empty-cell">
                 No rows match current filters
+              </td>
+            </tr>
+          )}
+          {(visibleRows.length > renderedRows.length || canLoadMore || isLoadingMore) && (
+            <tr>
+              <td colSpan={result.columns.length || 1} className="empty-cell">
+                {visibleRows.length > renderedRows.length ? (
+                  <button className="link-button" onClick={() => setRenderLimit((current) => current + renderStep)}>
+                    Show next {Math.min(renderStep, visibleRows.length - renderedRows.length)} loaded row(s)
+                  </button>
+                ) : isLoadingMore ? (
+                  "Loading more rows..."
+                ) : canLoadMore ? (
+                  <button className="link-button" onClick={onLoadMore}>
+                    Load more rows
+                  </button>
+                ) : null}
               </td>
             </tr>
           )}
