@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
@@ -181,7 +181,8 @@ function createWindow() {
     minWidth: 1120,
     minHeight: 760,
     title: "DB Explorer Pro",
-    icon: path.join(__dirname, "assets", process.platform === "darwin" ? "icon.icns" : "icon-512.png"),
+    icon: path.join(__dirname, "assets", process.platform === "darwin" ? "icon.icns" : "icon.ico"),
+    autoHideMenuBar: true,
     backgroundColor: "#f5f6fb",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -215,6 +216,8 @@ function createWindow() {
     `)}`);
     return;
   }
+
+  win.setMenuBarVisibility(false);
 
   if (isDev) {
     win.loadURL("http://127.0.0.1:5173");
@@ -262,6 +265,8 @@ ipcMain.handle("dialog:saveGeneratedFile", async (_event, sourcePath, defaultNam
 });
 
 app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+  app.setAppUserModelId("com.dbexplorerpro.desktop");
   initialOpenFile = getLaunchDatabaseFile(process.argv);
   apiPort = await findFreePort();
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;

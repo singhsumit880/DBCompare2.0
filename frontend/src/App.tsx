@@ -267,7 +267,6 @@ function formatSqlText(sql: string) {
 function sqlErrorToken(message: string) {
   return message.match(/near\s+"([^"]+)"/i)?.[1] ?? "";
 }
-
 function compareSqlText(leftSql: string, rightSql: string, caseSensitive: boolean): SqlTextCompareResult {
   const normalizeLines = (query: string) =>
     formatSqlText(query)
@@ -501,7 +500,6 @@ export function App() {
             {!collapsed && (
               <div>
                 <strong>DB Explorer Pro</strong>
-                <span>2.0</span>
               </div>
             )}
           </div>
@@ -1191,9 +1189,7 @@ function CompareWorkspace({
           compareDuration={compareDuration}
         />
         <ComparisonTable tables={tableResults} onViewMore={setDetailTable} />
-        {!!report && (report.schema.added_tables.length + report.schema.removed_tables.length + report.schema.column_diffs.length > 0) && (
-          <SchemaPanel report={report} />
-        )}
+        <SchemaPanel report={report} />
       </section>
 
       {isComparing && (
@@ -1440,7 +1436,7 @@ function TableDetailModal({
   db2Path: string;
   onClose: () => void;
 }) {
-  const hasSchemaDiff = schemaDiffCount(table) > 0;
+  const schemaChanges = schemaDiffCount(table);
   const [tab, setTab] = useState<DetailTab>(
     tableCount(table, "modified")
       ? "modified"
@@ -1448,7 +1444,7 @@ function TableDetailModal({
         ? "db1"
         : tableCount(table, "db2")
           ? "db2"
-          : hasSchemaDiff
+          : schemaChanges
             ? "schema"
             : "complete"
   );
@@ -1468,11 +1464,9 @@ function TableDetailModal({
           <button className={`${tab === "db1" ? "active" : ""} ${tableCount(table, "db1") > 0 ? "has-count" : ""}`} onClick={() => setTab("db1")}>DB1 only ({tableCount(table, "db1")})</button>
           <button className={`${tab === "db2" ? "active" : ""} ${tableCount(table, "db2") > 0 ? "has-count" : ""}`} onClick={() => setTab("db2")}>DB2 only ({tableCount(table, "db2")})</button>
           <button className={tab === "complete" ? "active" : ""} onClick={() => setTab("complete")}>Complete Data</button>
-          {hasSchemaDiff && (
-            <button className={`${tab === "schema" ? "active" : ""} has-count`} onClick={() => setTab("schema")}>
-              Schema Change ({schemaDiffCount(table)})
-            </button>
-          )}
+          <button className={`${tab === "schema" ? "active" : ""} ${schemaChanges > 0 ? "has-count" : ""}`} onClick={() => setTab("schema")}>
+            Schema Change ({schemaChanges})
+          </button>
         </div>
         <div className="detail-content">
           {tab === "modified" && <ModifiedGrid table={table} />}
@@ -1489,6 +1483,11 @@ function TableDetailModal({
 function ModifiedGrid({ table }: { table: TableDataResult }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [filter, setFilter] = useState("");
+  const [fieldDetail, setFieldDetail] = useState<{
+    column: string;
+    db1Value: unknown;
+    db2Value: unknown;
+  } | null>(null);
   const selected = table.modified_rows[selectedIndex] ?? table.modified_rows[0];
   const totalFieldChanges = table.modified_rows.reduce((sum, row) => sum + row.column_changes.length, 0);
   const modifiedTotal = tableCount(table, "modified");
@@ -1571,11 +1570,18 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
                       <div className="long-value">{formattedValueText(db2Value)}</div>
                     </td>
                     <td>
-                      <div className="change-inline">
-                        <span>{valueText(db1Value)}</span>
-                        <em>→</em>
-                        <span>{valueText(db2Value)}</span>
-                      </div>
+                      <button
+                        type="button"
+                        className="change-inline-button"
+                        title="Open full change details"
+                        onClick={() => setFieldDetail({ column, db1Value, db2Value })}
+                      >
+                        <div className="change-inline">
+                          <span>{valueText(db1Value)}</span>
+                          <em>--&gt;</em>
+                          <span>{valueText(db2Value)}</span>
+                        </div>
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -1585,6 +1591,14 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
           {!visibleChanges.length && <div className="muted-block compact">No matching field changes</div>}
         </section>
       </div>
+      {fieldDetail && (
+        <FieldDetailModal
+          column={fieldDetail.column}
+          db1Value={fieldDetail.db1Value}
+          db2Value={fieldDetail.db2Value}
+          onClose={() => setFieldDetail(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1599,8 +1613,8 @@ function CompleteDataView({
   db2Path: string;
 }) {
   const [filter, setFilter] = useState("");
-  const [loadedDb1Rows, setLoadedDb1Rows] = useState<Record<string, unknown>[]>(table.all_db1_rows ?? []);
-  const [loadedDb2Rows, setLoadedDb2Rows] = useState<Record<string, unknown>[]>(table.all_db2_rows ?? []);
+  const [loadedDb1Rows, setLoadedDb1Rows] = useState<Record<string, unknown>[]>([]);
+  const [loadedDb2Rows, setLoadedDb2Rows] = useState<Record<string, unknown>[]>([]);
   const [loadStatus, setLoadStatus] = useState("Loading complete table data");
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(100);
@@ -1608,21 +1622,17 @@ function CompleteDataView({
   const [db2Total, setDb2Total] = useState<number | null>(null);
 
   useEffect(() => {
+    setPage(0);
+  }, [table.table, db1Path, db2Path]);
+
+  useEffect(() => {
     let cancelled = false;
-    setLoadedDb1Rows(addSyntheticPk(table.all_db1_rows ?? []));
-    setLoadedDb2Rows(addSyntheticPk(table.all_db2_rows ?? []));
-    setDb1Total(table.all_db1_rows_count ?? table.all_db1_rows?.length ?? null);
-    setDb2Total(table.all_db2_rows_count ?? table.all_db2_rows?.length ?? null);
+    setLoadedDb1Rows([]);
+    setLoadedDb2Rows([]);
+    setDb1Total(null);
+    setDb2Total(null);
 
     async function loadCompleteRows() {
-      const hasEmbeddedCompleteData = table.all_db1_rows !== undefined || table.all_db2_rows !== undefined;
-      if (hasEmbeddedCompleteData && !cancelled) {
-        setDb1Total(table.all_db1_rows_count ?? table.all_db1_rows?.length ?? 0);
-        setDb2Total(table.all_db2_rows_count ?? table.all_db2_rows?.length ?? 0);
-        setLoadStatus("Showing complete data from comparison result");
-        return;
-      }
-
       try {
         setLoadStatus(`Loading page ${page + 1}`);
         const offset = page * pageSize;
@@ -1650,7 +1660,7 @@ function CompleteDataView({
     return () => {
       cancelled = true;
     };
-  }, [db1Path, db2Path, table, page, pageSize]);
+  }, [db1Path, db2Path, table.table, page, pageSize]);
 
   const db1Rows = loadedDb1Rows;
   const db2Rows = loadedDb2Rows;
@@ -1849,6 +1859,12 @@ function FieldDetailModal({
           </div>
           <button onClick={onClose}>Close</button>
         </header>
+        <div className="field-detail-summary">
+          <strong>Full change</strong>
+          <span>{valueText(db1Value)}</span>
+          <em>--&gt;</em>
+          <span>{valueText(db2Value)}</span>
+        </div>
         {jsonDiff && (
           <section className="json-diff-section">
             <div className="json-diff-title">
@@ -1926,13 +1942,23 @@ function SchemaDetail({ table }: { table: TableDataResult }) {
   return (
     <div className="schema-detail">
       <section>
-        <h3>Only in Database 1 ({diff.only_in_db1.length})</h3>
-        {diff.only_in_db1.map((column) => <span key={column}>{column}</span>)}
+        <h3>Columns Removed In Database 2 ({diff.only_in_db1.length})</h3>
+        {diff.only_in_db1.map((column) => (
+          <div key={column} className="schema-change-chip removed">
+            <strong>Column removed</strong>
+            <span>{column}</span>
+          </div>
+        ))}
         {!diff.only_in_db1.length && <em>None</em>}
       </section>
       <section>
-        <h3>Only in Database 2 ({diff.only_in_db2.length})</h3>
-        {diff.only_in_db2.map((column) => <span key={column}>{column}</span>)}
+        <h3>Columns Added In Database 2 ({diff.only_in_db2.length})</h3>
+        {diff.only_in_db2.map((column) => (
+          <div key={column} className="schema-change-chip added">
+            <strong>Column added</strong>
+            <span>{column}</span>
+          </div>
+        ))}
         {!diff.only_in_db2.length && <em>None</em>}
       </section>
     </div>

@@ -1,6 +1,6 @@
 {
   "name": "db-explorer-pro",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "DB Explorer Pro",
   "main": "electron/main.cjs",
@@ -55,21 +55,6 @@
         ]
       }
     ],
-    "fileAssociations": [
-      {
-        "ext": [
-          "vyp",
-          "vyb",
-          "db",
-          "sqlite",
-          "sqlite3"
-        ],
-        "name": "DB Explorer Pro Database",
-        "description": "Open database with DB Explorer Pro",
-        "icon": "icon.ico",
-        "role": "Viewer"
-      }
-    ],
     "win": {
       "target": [
         "nsis",
@@ -78,12 +63,26 @@
       "signAndEditExecutable": false,
       "icon": "icon.ico"
     },
+    "nsis": {
+      "artifactName": "DB Explorer Pro Setup ${version}.${ext}",
+      "installerIcon": "electron/assets/icon.ico",
+      "uninstallerIcon": "electron/assets/icon.ico",
+      "installerHeaderIcon": "electron/assets/icon.ico",
+      "include": "electron/installer.nsh",
+      "uninstallDisplayName": "DB Explorer Pro ${version}"
+    },
+    "portable": {
+      "artifactName": "DB Explorer Pro ${version}.${ext}"
+    },
     "mac": {
       "target": [
         "dmg"
       ],
       "icon": "icon.icns",
       "category": "public.app-category.developer-tools"
+    },
+    "dmg": {
+      "artifactName": "DB Explorer Pro ${version}.${ext}"
     }
   }
 }
