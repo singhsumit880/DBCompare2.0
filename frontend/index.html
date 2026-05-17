@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DB Explorer Pro</title>
+    <style>
+      body {
+        margin: 0;
+        background: #f5f6fb;
+      }
+
+      #root:empty {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        color: #111827;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+
+      #root:empty::before {
+        width: 42px;
+        height: 42px;
+        border: 4px solid #dce6f5;
+        border-top-color: #4169f4;
+        border-radius: 999px;
+        animation: boot-spin 0.8s linear infinite;
+        content: "";
+      }
+
+      #root:empty::after {
+        margin-top: 70px;
+        color: #5f6b82;
+        content: "App opening, please wait...";
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
