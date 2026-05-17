@@ -7,11 +7,12 @@ import sqlite3
 import zipfile
 import logging
 import shutil
+import uuid
 from typing import List, Optional
 
 from core.utils import unzip_vyb, find_vyp_in_dir, get_temp_dir, cleanup_dir
 
-SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb', '.sqlite', '.db'}
+SUPPORTED_EXTENSIONS = {'.vyp', '.zip', '.vyb', '.sqlite', '.sqlite3', '.db'}
 
 
 def is_valid_sqlite(db_path: str) -> bool:
@@ -37,7 +38,7 @@ def extract_vyp_from_vyb(vyb_path: str, temp_dirs: List[str]) -> str:
             if not vyp_files:
                 raise ValueError("No .vyp file found in the .vyb archive")
 
-            temp_dir = get_temp_dir('_extract_tmp')
+            temp_dir = get_temp_dir(f'_extract_tmp_{uuid.uuid4().hex}')
             temp_dirs.append(temp_dir)
             vyp_name = vyp_files[0]
             extracted_path = os.path.join(temp_dir, os.path.basename(vyp_name))
@@ -63,7 +64,7 @@ def extract_database_file(file_path: str, temp_dirs: List[str]) -> str:
     """
     ext = os.path.splitext(file_path)[1].lower()
 
-    if ext in ('.vyp', '.sqlite', '.db'):
+    if ext in ('.vyp', '.sqlite', '.sqlite3', '.db'):
         return file_path
 
     if ext == '.vyb':
@@ -77,7 +78,7 @@ def extract_database_file(file_path: str, temp_dirs: List[str]) -> str:
             with zipfile.ZipFile(file_path, 'r') as zf:
                 for info in zf.infolist():
                     if any(info.filename.lower().endswith(e) for e in ('.sqlite', '.db')):
-                        temp_dir = get_temp_dir('_zip_extract_tmp')
+                        temp_dir = get_temp_dir(f'_zip_extract_tmp_{uuid.uuid4().hex}')
                         temp_dirs.append(temp_dir)
                         dest = os.path.join(temp_dir, os.path.basename(info.filename))
                         with open(dest, 'wb') as f:

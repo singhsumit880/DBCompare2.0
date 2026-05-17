@@ -22,6 +22,7 @@ DEFAULT_IGNORED_TYPES: Set[str] = {"date", "datetime", "timestamp"}
 DEFAULT_DECIMAL_PRECISION: int = 5
 
 ProgressCallback = Callable[[str, Optional[int]], None]
+CancelCheck = Callable[[], bool]
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,12 @@ class TableDataResult:
     modified_rows: List[ModifiedRow] = field(default_factory=list)
     all_db1_rows: List[Dict[str, Any]] = field(default_factory=list)
     all_db2_rows: List[Dict[str, Any]] = field(default_factory=list)
+    rows_only_in_db1_count: int = 0
+    rows_only_in_db2_count: int = 0
+    modified_rows_count: int = 0
+    all_db1_rows_count: int = 0
+    all_db2_rows_count: int = 0
+    result_limited: bool = False
     # If schemas differ, this holds the column-level diff for banner display
     column_schema_diff: Optional['ColumnDiff'] = None
 
@@ -82,7 +89,7 @@ class TableDataResult:
 
     @property
     def has_differences(self) -> bool:
-        return bool(self.rows_only_in_db1 or self.rows_only_in_db2 or self.modified_rows)
+        return bool(self.rows_only_in_db1_count or self.rows_only_in_db2_count or self.modified_rows_count)
 
 
 @dataclass
@@ -114,12 +121,18 @@ class DatabaseComparator:
         self._progress: ProgressCallback = lambda msg, pct: None
         self.decimal_precision = DEFAULT_DECIMAL_PRECISION
         self.ignored_types: Set[str] = DEFAULT_IGNORED_TYPES
+        self.max_result_rows_per_table = 500
+        self._cancel_check: CancelCheck = lambda: False
 
     def set_progress(self, callback: ProgressCallback) -> None:
         self._progress = callback
 
     def _emit(self, msg: str, pct: Optional[int] = None) -> None:
         self._progress(msg, pct)
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_check():
+            raise InterruptedError("Comparison cancelled")
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,14 +147,19 @@ class DatabaseComparator:
         ignore_datetime: bool = True,
         decimal_precision: int = DEFAULT_DECIMAL_PRECISION,
         validate_db: bool = True,
+        max_result_rows_per_table: int = 500,
+        cancel_check: Optional[CancelCheck] = None,
     ) -> ComparisonReport:
 
         self.decimal_precision = decimal_precision
         self.ignored_types = DEFAULT_IGNORED_TYPES if ignore_datetime else set()
+        self.max_result_rows_per_table = max(0, max_result_rows_per_table)
+        self._cancel_check = cancel_check or (lambda: False)
         included_tables = included_tables or set()
         excluded_tables = excluded_tables or set()
 
         try:
+            self._check_cancelled()
             self._connect(db1_path, db2_path, validate_db)
 
             db1_tables = set(self._get_tables(self._db1_conn))
@@ -159,7 +177,9 @@ class DatabaseComparator:
             db2_tables -= excluded_tables
 
             version = self._compare_versions()
+            self._check_cancelled()
             schema  = self._compare_schemas(db1_tables, db2_tables)
+            self._check_cancelled()
             data    = self._compare_data(db1_tables & db2_tables)
 
             return ComparisonReport(
@@ -266,6 +286,7 @@ class DatabaseComparator:
         )
         common = sorted(db1_tables & db2_tables)
         for i, table in enumerate(common):
+            self._check_cancelled()
             self._emit(f"Schema: {table}", 10 + int(30 * i / max(len(common), 1)))
             c1_names = {c['name'] for c in self._get_columns(self._db1_conn, table)}
             c2_names = {c['name'] for c in self._get_columns(self._db2_conn, table)}
@@ -297,6 +318,7 @@ class DatabaseComparator:
 
         tables = sorted(common_tables)
         for i, table in enumerate(tables):
+            self._check_cancelled()
             self._emit(f"Data: {table}", 40 + int(55 * i / max(len(tables), 1)))
 
             cols1 = self._get_columns(self._db1_conn, table)
@@ -337,72 +359,101 @@ class DatabaseComparator:
             if not pk_cols:
                 pk_cols = common_cols[:1]
 
-            order_by = ", ".join(self._quote(c) for c in pk_cols)
+            order_by = ", ".join(f"CAST({self._quote(c)} AS TEXT)" for c in pk_cols)
 
             # Fetch only common columns from each DB
             cols_str = ", ".join(self._quote(c) for c in common_cols)
             query    = f'SELECT {cols_str} FROM {self._quote(table)} ORDER BY {order_by};'
 
-            db1_rows = self._db1_conn.execute(query).fetchall()
-            db2_rows = self._db2_conn.execute(query).fetchall()
+            count_query = f"SELECT COUNT(*) FROM {self._quote(table)}"
+            tdr.all_db1_rows_count = self._db1_conn.execute(count_query).fetchone()[0]
+            tdr.all_db2_rows_count = self._db2_conn.execute(count_query).fetchone()[0]
 
             pk_indices = [common_cols.index(c) for c in pk_cols]
 
-            def make_pk(row: tuple) -> Any:
-                vals = tuple('' if row[idx] is None else row[idx] for idx in pk_indices)
-                return vals if len(vals) > 1 else vals[0]
+            def make_pk(row: tuple) -> Tuple[str, ...]:
+                return tuple('' if row[idx] is None else str(row[idx]) for idx in pk_indices)
 
-            db1_map = {make_pk(r): r for r in db1_rows}
-            db2_map = {make_pk(r): r for r in db2_rows}
+            def pk_for_result(pk: Tuple[str, ...]) -> Any:
+                return pk if len(pk) > 1 else pk[0]
 
-            all_pks = set(db1_map) | set(db2_map)
-            try:
-                sorted_pks = sorted(all_pks)
-            except TypeError:
-                sorted_pks = sorted(all_pks, key=str)
+            def pk_dict_for_result(pk: Tuple[str, ...]) -> Dict[str, Any]:
+                return dict(zip(pk_cols, pk))
 
-            for pk in sorted(db1_map, key=str):
-                row_dict = dict(zip(common_cols, (self._round(v) for v in db1_map[pk])))
-                tdr.all_db1_rows.append({'_pk': pk, **row_dict})
+            def rounded_row(row: tuple) -> Dict[str, Any]:
+                return dict(zip(common_cols, (self._round(v) for v in row)))
 
-            for pk in sorted(db2_map, key=str):
-                row_dict = dict(zip(common_cols, (self._round(v) for v in db2_map[pk])))
-                tdr.all_db2_rows.append({'_pk': pk, **row_dict})
+            def record_db1_only(pk: Tuple[str, ...], row: tuple) -> None:
+                tdr.rows_only_in_db1_count += 1
+                if len(tdr.rows_only_in_db1) < self.max_result_rows_per_table:
+                    tdr.rows_only_in_db1.append({'_pk': pk_for_result(pk), **rounded_row(row)})
+                else:
+                    tdr.result_limited = True
 
-            for pk in sorted_pks:
-                in1, in2 = pk in db1_map, pk in db2_map
+            def record_db2_only(pk: Tuple[str, ...], row: tuple) -> None:
+                tdr.rows_only_in_db2_count += 1
+                if len(tdr.rows_only_in_db2) < self.max_result_rows_per_table:
+                    tdr.rows_only_in_db2.append({'_pk': pk_for_result(pk), **rounded_row(row)})
+                else:
+                    tdr.result_limited = True
 
-                if in1 and not in2:
-                    row_dict = dict(zip(common_cols, (self._round(v) for v in db1_map[pk])))
-                    tdr.rows_only_in_db1.append({'_pk': pk, **row_dict})
+            def record_if_modified(pk: Tuple[str, ...], row1: tuple, row2: tuple) -> None:
+                changes: List[Tuple[str, Any, Any]] = []
+                for idx, (v1, v2) in enumerate(zip(row1, row2)):
+                    col_name = common_cols[idx]
+                    col_meta = col1_meta.get(col_name, {})
+                    col_type = col_meta.get('type', '').lower()
+                    if any(ign in col_type for ign in self.ignored_types):
+                        continue
+                    if not self._values_equal(v1, v2):
+                        changes.append((col_name, self._round(v1), self._round(v2)))
+                if not changes:
+                    return
 
-                elif in2 and not in1:
-                    row_dict = dict(zip(common_cols, (self._round(v) for v in db2_map[pk])))
-                    tdr.rows_only_in_db2.append({'_pk': pk, **row_dict})
+                tdr.modified_rows_count += 1
+                if len(tdr.modified_rows) < self.max_result_rows_per_table:
+                    tdr.modified_rows.append(
+                        ModifiedRow(
+                            pk=pk_dict_for_result(pk),
+                            column_changes=changes,
+                            db1_row=rounded_row(row1),
+                            db2_row=rounded_row(row2),
+                        )
+                    )
+                else:
+                    tdr.result_limited = True
+
+            db1_cursor = self._db1_conn.execute(query)
+            db2_cursor = self._db2_conn.execute(query)
+            row1 = db1_cursor.fetchone()
+            row2 = db2_cursor.fetchone()
+
+            while row1 is not None or row2 is not None:
+                if (tdr.modified_rows_count + tdr.rows_only_in_db1_count + tdr.rows_only_in_db2_count) % 1000 == 0:
+                    self._check_cancelled()
+                pk1 = make_pk(row1) if row1 is not None else None
+                pk2 = make_pk(row2) if row2 is not None else None
+
+                if row2 is None:
+                    record_db1_only(pk1, row1)
+                    row1 = db1_cursor.fetchone()
+
+                elif row1 is None:
+                    record_db2_only(pk2, row2)
+                    row2 = db2_cursor.fetchone()
+
+                elif pk1 < pk2:
+                    record_db1_only(pk1, row1)
+                    row1 = db1_cursor.fetchone()
+
+                elif pk2 < pk1:
+                    record_db2_only(pk2, row2)
+                    row2 = db2_cursor.fetchone()
 
                 else:
-                    row1, row2 = db1_map[pk], db2_map[pk]
-                    changes: List[Tuple[str, Any, Any]] = []
-                    for idx, (v1, v2) in enumerate(zip(row1, row2)):
-                        col_name = common_cols[idx]
-                        col_meta = col1_meta.get(col_name, {})
-                        col_type = col_meta.get('type', '').lower()
-                        if any(ign in col_type for ign in self.ignored_types):
-                            continue
-                        if not self._values_equal(v1, v2):
-                            changes.append((col_name, self._round(v1), self._round(v2)))
-                    if changes:
-                        pk_dict = dict(zip(pk_cols, pk)) if isinstance(pk, tuple) else {pk_cols[0]: pk}
-                        db1_row = dict(zip(common_cols, (self._round(v) for v in row1)))
-                        db2_row = dict(zip(common_cols, (self._round(v) for v in row2)))
-                        tdr.modified_rows.append(
-                            ModifiedRow(
-                                pk=pk_dict,
-                                column_changes=changes,
-                                db1_row=db1_row,
-                                db2_row=db2_row,
-                            )
-                        )
+                    record_if_modified(pk1, row1, row2)
+                    row1 = db1_cursor.fetchone()
+                    row2 = db2_cursor.fetchone()
 
             results.append(tdr)
 

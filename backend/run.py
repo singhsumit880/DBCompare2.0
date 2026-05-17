@@ -1,4 +1,5 @@
 """Runner for the DBCompare API."""
+import os
 from pathlib import Path
 import sys
 
@@ -12,4 +13,5 @@ from backend.main import app
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+    port = int(os.environ.get("DB_EXPLORER_API_PORT", "8765"))
+    uvicorn.run(app, host="127.0.0.1", port=port)

@@ -1,25 +1,38 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync, spawn } = require("node:child_process");
 const http = require("node:http");
+const net = require("node:net");
 
 const isDev = !app.isPackaged;
 let apiProcess = null;
-const apiBaseUrl = "http://127.0.0.1:8765";
+let apiPort = null;
+let apiBaseUrl = null;
+let backendStartupError = null;
+let initialOpenFile = null;
 const requiredDevRoutes = [
   "/api/compare",
+  "/api/compare/jobs",
+  "/api/compare/jobs/{job_id}",
+  "/api/compare/jobs/{job_id}/result",
+  "/api/compare/jobs/{job_id}/cancel",
   "/api/tools/sanitize",
   "/api/tools/convert",
   "/api/tools/fts",
   "/api/tools/settings-repair",
   "/api/sql/tables",
   "/api/sql/table-info",
+  "/api/sql/schema",
   "/api/sql/checks",
   "/api/sql/version",
   "/api/sql/rows",
+  "/api/sql/update-row",
+  "/api/sql/update-rows-batch",
   "/api/sql/related-rows",
-  "/api/sql/query"
+  "/api/sql/query",
+  "/api/sql/compare-query",
+  "/api/sql/export"
 ];
 
 function backendExecutable() {
@@ -39,10 +52,40 @@ function backendExecutable() {
   };
 }
 
+function isDatabaseFile(filePath) {
+  if (!filePath || filePath.startsWith("-")) return false;
+  const extension = path.extname(filePath).toLowerCase();
+  return [".vyp", ".vyb", ".db", ".sqlite", ".sqlite3"].includes(extension);
+}
+
+function getLaunchDatabaseFile(argv) {
+  return argv.find((arg) => isDatabaseFile(arg)) || null;
+}
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      server.close(() => {
+        if (port) resolve(port);
+        else reject(new Error("Could not allocate a backend port"));
+      });
+    });
+  });
+}
+
 function startBackend() {
   const backend = backendExecutable();
   apiProcess = spawn(backend.command, backend.args, {
     cwd: backend.cwd,
+    env: {
+      ...process.env,
+      DB_EXPLORER_API_PORT: String(apiPort)
+    },
     stdio: isDev ? "inherit" : "ignore",
     windowsHide: true
   });
@@ -85,6 +128,20 @@ async function hasCurrentBackendRoutes() {
   }
 }
 
+async function waitForBackend(timeoutMs = 15000) {
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      if (await hasCurrentBackendRoutes()) return true;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error(lastError?.message || `Backend did not start on ${apiBaseUrl}`);
+}
+
 function listeningPidsForPort(port) {
   if (process.platform !== "win32") return [];
   try {
@@ -105,9 +162,9 @@ function listeningPidsForPort(port) {
 }
 
 async function prepareDevBackendPort() {
-  if (!isDev) return;
+  if (!isDev || !apiPort) return;
   if (await hasCurrentBackendRoutes()) return;
-  for (const pid of listeningPidsForPort(8765)) {
+  for (const pid of listeningPidsForPort(apiPort)) {
     try {
       process.kill(pid);
     } catch {
@@ -124,14 +181,43 @@ function createWindow() {
     minWidth: 1120,
     minHeight: 760,
     title: "DB Explorer Pro",
-    icon: path.join(__dirname, "assets", process.platform === "darwin" ? "icon.icns" : "icon-512.png"),
-    backgroundColor: "#111827",
+    icon: path.join(__dirname, "assets", process.platform === "darwin" ? "icon.icns" : "icon.ico"),
+    autoHideMenuBar: true,
+    backgroundColor: "#f5f6fb",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      additionalArguments: [
+        `--api-base-url=${apiBaseUrl}`,
+        `--open-file=${encodeURIComponent(initialOpenFile || "")}`
+      ]
     }
   });
+
+  if (backendStartupError) {
+    const escaped = backendStartupError.replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;"
+    }[char]));
+    win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+      <html>
+        <head><title>DB Explorer Pro</title></head>
+        <body style="font-family: Arial, sans-serif; padding: 40px; color: #111827;">
+          <h1>Backend could not start</h1>
+          <p>DB Explorer Pro could not start its local API service.</p>
+          <pre style="white-space: pre-wrap; background: #f3f4f6; padding: 16px; border-radius: 8px;">${escaped}</pre>
+          <p>Please restart the app. If the issue continues, check antivirus permissions or install the backend build dependency.</p>
+        </body>
+      </html>
+    `)}`);
+    return;
+  }
+
+  win.setMenuBarVisibility(false);
 
   if (isDev) {
     win.loadURL("http://127.0.0.1:5173");
@@ -179,10 +265,26 @@ ipcMain.handle("dialog:saveGeneratedFile", async (_event, sourcePath, defaultNam
 });
 
 app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+  app.setAppUserModelId("com.dbexplorerpro.desktop");
+  initialOpenFile = getLaunchDatabaseFile(process.argv);
+  apiPort = await findFreePort();
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
   await prepareDevBackendPort();
-  startBackend();
+  try {
+    startBackend();
+    await waitForBackend();
+  } catch (error) {
+    backendStartupError = error instanceof Error ? error.message : String(error);
+  }
   createWindow();
 });
+
+ipcMain.handle("backend:status", async () => ({
+  ok: !backendStartupError,
+  apiBaseUrl,
+  error: backendStartupError
+}));
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
