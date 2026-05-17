@@ -1,18 +1,29 @@
-import { useEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type UIEvent } from "react";
 import {
   AlertTriangle,
   ArrowLeftToLine,
   ArrowRight,
   ArrowRightToLine,
+  BarChart3,
+  CheckCircle2,
+  Code2,
   Database,
   Download,
+  Eye,
+  FileDown,
   FolderOpen,
+  GitCompare,
   Link2,
+  Minus,
+  Network,
   Play,
+  Plus,
   RefreshCcw,
   RotateCcw,
   Rows3,
   Search,
+  Settings2,
+  Square,
   Table2,
   Wrench
 } from "lucide-react";
@@ -21,19 +32,32 @@ import {
   cancelCompareJob,
   convertDatabase,
   databaseChecks,
+  databaseSchema,
   databaseVersion,
   executeSql,
+  exportSqlData,
   getCompareJob,
   getCompareJobResult,
   listTables,
+  relatedRows,
   repairSettingsTable,
   sanitizeDatabase,
   startCompareJob,
   tableInfo,
   tableRows,
-  updateRow
+  updateRowsBatch
 } from "./api";
-import type { ComparisonReport, RowUpdateResult, SqlQueryResult, TableColumn, TableDataResult, ToolRunResult } from "./types";
+import type {
+  ComparisonReport,
+  BatchRowEdit,
+  DatabaseSchemaResult,
+  ExportFormat,
+  ExportSource,
+  SqlQueryResult,
+  TableColumn,
+  TableDataResult,
+  ToolRunResult
+} from "./types";
 
 const DEFAULT_EXCLUDES = [
   "kb_fts_vtable",
@@ -61,10 +85,63 @@ INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.VYAPAR.SYNCENABLED', '0');
 UPDATE kb_transactions SET mobile_no = '';`;
 
+const SQL_KEYWORDS = [
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "JOIN",
+  "LEFT JOIN",
+  "INNER JOIN",
+  "ON",
+  "GROUP BY",
+  "ORDER BY",
+  "HAVING",
+  "LIMIT",
+  "OFFSET",
+  "COUNT",
+  "SUM",
+  "AVG",
+  "MIN",
+  "MAX",
+  "DISTINCT",
+  "AS",
+  "AND",
+  "OR",
+  "NOT",
+  "IN",
+  "LIKE",
+  "BETWEEN",
+  "IS NULL",
+  "IS NOT NULL",
+  "INSERT INTO",
+  "UPDATE",
+  "SET",
+  "DELETE FROM",
+  "CREATE TABLE",
+  "ALTER TABLE",
+  "DROP TABLE"
+];
+
+const SQL_SNIPPETS = [
+  "SELECT *",
+  "WHERE",
+  "JOIN",
+  "GROUP BY",
+  "ORDER BY",
+  "COUNT(*)",
+  "INSERT",
+  "UPDATE",
+  "DELETE"
+];
+
 type NavigationItem = {
   label: string;
   table: string;
   query?: string;
+  related?: {
+    column: string;
+    value: unknown;
+  };
 };
 
 type SelectedRowState = {
@@ -72,7 +149,21 @@ type SelectedRowState = {
   key: Record<string, unknown>;
 };
 
-type Screen = "compare" | "sql" | "sanitizer" | "settings" | "fts";
+type SqlTextCompareResult = {
+  match: boolean;
+  leftOnly: string[];
+  rightOnly: string[];
+  sharedCount: number;
+  leftLineCount: number;
+  rightLineCount: number;
+};
+
+type DiffWordPart = {
+  text: string;
+  changed: boolean;
+};
+
+type Screen = "compare" | "sqlCompare" | "sql" | "sanitizer" | "settings" | "fts";
 type DetailTab = "modified" | "complete" | "db1" | "db2" | "schema";
 
 function valueText(value: unknown) {
@@ -98,6 +189,152 @@ function formattedValueText(value: unknown) {
   } catch {
     return text;
   }
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function highlightedSqlHtml(sql: string, tableNames: string[], columnNames: string[], errorToken = "") {
+  const tableSet = new Set(tableNames.map((name) => name.toLowerCase()));
+  const columnSet = new Set(columnNames.map((name) => name.toLowerCase()));
+  const keywordSet = new Set(SQL_KEYWORDS.flatMap((keyword) => keyword.toUpperCase().split(/\s+/)));
+  const tokenPattern = /("[^"]*"|'[^']*'|\b[A-Za-z_][A-Za-z0-9_]*\b|\d+(?:\.\d+)?|--.*?$|[(),.;*=<>+-])/gim;
+  let cursor = 0;
+  let html = "";
+
+  for (const match of sql.matchAll(tokenPattern)) {
+    const token = match[0];
+    const index = match.index ?? 0;
+    html += escapeHtml(sql.slice(cursor, index));
+
+    const unquoted = token.replace(/^["']|["']$/g, "");
+    const normalized = unquoted.toLowerCase();
+    const upper = token.toUpperCase();
+    let className = "";
+
+    if (errorToken && unquoted.toLowerCase() === errorToken.toLowerCase()) className = "error-token";
+    else if (token.startsWith("--")) className = "comment";
+    else if (token.startsWith("'")) className = "string";
+    else if (/^\d/.test(token)) className = "number";
+    else if (tableSet.has(normalized)) className = "table-name";
+    else if (columnSet.has(normalized)) className = "column-name";
+    else if (keywordSet.has(upper)) className = "keyword";
+
+    html += className ? `<span class="${className}">${escapeHtml(token)}</span>` : escapeHtml(token);
+    cursor = index + token.length;
+  }
+
+  html += escapeHtml(sql.slice(cursor));
+  return html || " ";
+}
+
+function formatSqlText(sql: string) {
+  const normalized = sql
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\s*;\s*/g, ";\n")
+    .trim();
+  const breakBefore = [
+    "FROM",
+    "WHERE",
+    "LEFT JOIN",
+    "INNER JOIN",
+    "JOIN",
+    "ON",
+    "GROUP BY",
+    "HAVING",
+    "ORDER BY",
+    "LIMIT",
+    "OFFSET",
+    "VALUES",
+    "SET"
+  ];
+
+  return breakBefore
+    .reduce((text, keyword) => {
+      const pattern = new RegExp(`\\s+${keyword.replace(/\s+/g, "\\s+")}\\s+`, "gi");
+      return text.replace(pattern, `\n${keyword} `);
+    }, normalized)
+    .replace(/,\s*/g, ",\n  ")
+    .replace(/\n\s*\n/g, "\n")
+    .trim();
+}
+
+function sqlErrorToken(message: string) {
+  return message.match(/near\s+"([^"]+)"/i)?.[1] ?? "";
+}
+
+function compareSqlText(leftSql: string, rightSql: string, caseSensitive: boolean): SqlTextCompareResult {
+  const normalizeLines = (query: string) =>
+    formatSqlText(query)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  const signature = (line: string) => {
+    const normalized = line.replace(/\s+/g, " ");
+    return caseSensitive ? normalized : normalized.toLowerCase();
+  };
+  const leftLines = normalizeLines(leftSql);
+  const rightLines = normalizeLines(rightSql);
+  const leftBySignature = new Map(leftLines.map((line) => [signature(line), line]));
+  const rightBySignature = new Map(rightLines.map((line) => [signature(line), line]));
+  const leftKeys = new Set(leftBySignature.keys());
+  const rightKeys = new Set(rightBySignature.keys());
+  const leftOnly = [...leftKeys].filter((key) => !rightKeys.has(key)).map((key) => leftBySignature.get(key) ?? key);
+  const rightOnly = [...rightKeys].filter((key) => !leftKeys.has(key)).map((key) => rightBySignature.get(key) ?? key);
+  const sharedCount = [...leftKeys].filter((key) => rightKeys.has(key)).length;
+
+  return {
+    match: leftOnly.length === 0 && rightOnly.length === 0 && leftLines.length === rightLines.length,
+    leftOnly,
+    rightOnly,
+    sharedCount,
+    leftLineCount: leftLines.length,
+    rightLineCount: rightLines.length
+  };
+}
+
+function diffWordParts(left: string, right: string, caseSensitive: boolean): { left: DiffWordPart[]; right: DiffWordPart[] } {
+  const leftWords = left.match(/\S+\s*/g) ?? [];
+  const rightWords = right.match(/\S+\s*/g) ?? [];
+  const normalize = (word: string) => caseSensitive ? word.trim() : word.trim().toLowerCase();
+  const leftTokens = leftWords.map(normalize);
+  const rightTokens = rightWords.map(normalize);
+  const dp = Array.from({ length: leftTokens.length + 1 }, () => Array(rightTokens.length + 1).fill(0));
+
+  for (let i = leftTokens.length - 1; i >= 0; i -= 1) {
+    for (let j = rightTokens.length - 1; j >= 0; j -= 1) {
+      dp[i][j] = leftTokens[i] === rightTokens[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const leftChanged = new Set<number>();
+  const rightChanged = new Set<number>();
+  let i = 0;
+  let j = 0;
+  while (i < leftTokens.length || j < rightTokens.length) {
+    if (i < leftTokens.length && j < rightTokens.length && leftTokens[i] === rightTokens[j]) {
+      i += 1;
+      j += 1;
+    } else if (j >= rightTokens.length || (i < leftTokens.length && dp[i + 1][j] >= dp[i][j + 1])) {
+      leftChanged.add(i);
+      i += 1;
+    } else {
+      rightChanged.add(j);
+      j += 1;
+    }
+  }
+
+  return {
+    left: leftWords.map((text, index) => ({ text, changed: leftChanged.has(index) })),
+    right: rightWords.map((text, index) => ({ text, changed: rightChanged.has(index) }))
+  };
 }
 
 type JsonDiffRow = {
@@ -243,7 +480,7 @@ function sleep(ms: number) {
 
 export function App() {
   const [screen, setScreen] = useState<Screen>("sql");
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
   const [db1, setDb1] = useState("");
   const [db2, setDb2] = useState("");
   const [activeDb, setActiveDb] = useState("");
@@ -270,28 +507,32 @@ export function App() {
           </div>
         </div>
         <nav>
-          <button className={screen === "sql" ? "active" : ""} onClick={() => setScreen("sql")}>
+          <button className={screen === "sql" ? "active" : ""} onClick={() => setScreen("sql")} title="Open DB" aria-label="Open DB" data-label="Open DB">
             <img className="menu-icon" src="./menu-icons/open-db.png" alt="" />
             {!collapsed && <span>Open DB</span>}
           </button>
-          <button className={screen === "compare" ? "active" : ""} onClick={() => setScreen("compare")}>
+          <button className={screen === "compare" ? "active" : ""} onClick={() => setScreen("compare")} title="DB Compare" aria-label="DB Compare" data-label="DB Compare">
             <img className="menu-icon" src="./menu-icons/db-compare.png" alt="" />
             {!collapsed && <span>DB Compare</span>}
           </button>
-          <button className={screen === "sanitizer" ? "active" : ""} onClick={() => setScreen("sanitizer")}>
+          <button className={screen === "sqlCompare" ? "active" : ""} onClick={() => setScreen("sqlCompare")} title="SQL Compare" aria-label="SQL Compare" data-label="SQL Compare">
+            <GitCompare className="menu-icon" size={20} />
+            {!collapsed && <span>SQL Compare</span>}
+          </button>
+          <button className={screen === "sanitizer" ? "active" : ""} onClick={() => setScreen("sanitizer")} title="DB Sanitizer" aria-label="DB Sanitizer" data-label="DB Sanitizer">
             <img className="menu-icon" src="./menu-icons/db-sanitizer.png" alt="" />
             {!collapsed && <span>DB Sanitizer</span>}
           </button>
-          <button className={screen === "settings" ? "active" : ""} onClick={() => setScreen("settings")}>
+          <button className={screen === "settings" ? "active" : ""} onClick={() => setScreen("settings")} title="Setting Table Repair" aria-label="Setting Table Repair" data-label="Setting Table Repair">
             <img className="menu-icon" src="./menu-icons/setting-repair.png" alt="" />
             {!collapsed && <span>Setting Table Repair</span>}
           </button>
-          <button className={screen === "fts" ? "active" : ""} onClick={() => setScreen("fts")}>
+          <button className={screen === "fts" ? "active" : ""} onClick={() => setScreen("fts")} title="FTS Table Generator" aria-label="FTS Table Generator" data-label="FTS Table Generator">
             <img className="menu-icon" src="./menu-icons/fts.png" alt="" />
             {!collapsed && <span>FTS Table Generator</span>}
           </button>
         </nav>
-        <button className="icon-button sidebar-collapse" title="Collapse menu" onClick={() => setCollapsed((value) => !value)}>
+        <button className="icon-button sidebar-collapse" title={collapsed ? "Expand menu" : "Collapse menu"} onClick={() => setCollapsed((value) => !value)}>
           {collapsed ? <ArrowRightToLine size={18} /> : <ArrowLeftToLine size={18} />}
         </button>
       </aside>
@@ -299,6 +540,8 @@ export function App() {
       <section className="workspace">
         {screen === "compare" ? (
           <CompareWorkspace db1={db1} db2={db2} setDb1={setDb1} setDb2={setDb2} />
+        ) : screen === "sqlCompare" ? (
+          <SqlCompareWorkspace />
         ) : screen === "sql" ? (
           <SqlExplorer dbPath={activeDb} setDbPath={setActiveDb} />
         ) : screen === "sanitizer" ? (
@@ -948,7 +1191,9 @@ function CompareWorkspace({
           compareDuration={compareDuration}
         />
         <ComparisonTable tables={tableResults} onViewMore={setDetailTable} />
-        <SchemaPanel report={report} />
+        {!!report && (report.schema.added_tables.length + report.schema.removed_tables.length + report.schema.column_diffs.length > 0) && (
+          <SchemaPanel report={report} />
+        )}
       </section>
 
       {isComparing && (
@@ -966,6 +1211,46 @@ function CompareWorkspace({
       <footer className="statusbar">{status}</footer>
       {detailTable && <TableDetailModal table={detailTable} db1Path={db1} db2Path={db2} onClose={() => setDetailTable(null)} />}
     </>
+  );
+}
+
+function SqlCompareWorkspace() {
+  const [leftSql, setLeftSql] = useState("");
+  const [rightSql, setRightSql] = useState("");
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [compareResult, setCompareResult] = useState<SqlTextCompareResult | null>(null);
+
+  function runCompare() {
+    if (!leftSql.trim() || !rightSql.trim()) {
+      setCompareResult(null);
+      return;
+    }
+    setCompareResult(compareSqlText(leftSql, rightSql, caseSensitive));
+  }
+
+  useEffect(() => {
+    if (!compareResult) return;
+    if (!leftSql.trim() || !rightSql.trim()) {
+      setCompareResult(null);
+      return;
+    }
+    setCompareResult(compareSqlText(leftSql, rightSql, caseSensitive));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseSensitive]);
+
+  return (
+    <section className="standalone-sql-compare">
+      <QueryComparePanel
+        leftSql={leftSql}
+        rightSql={rightSql}
+        setLeftSql={setLeftSql}
+        setRightSql={setRightSql}
+        caseSensitive={caseSensitive}
+        setCaseSensitive={setCaseSensitive}
+        compareResult={compareResult}
+        onCompare={runCompare}
+      />
+    </section>
   );
 }
 
@@ -1051,7 +1336,7 @@ function ComparisonTable({
           <thead>
             <tr>
               <th>Table Name</th>
-              <th>Schema Config</th>
+              <th>Schema Change</th>
               <th>Data Differences</th>
               <th>DB1 Only</th>
               <th>DB2 Only</th>
@@ -1066,7 +1351,7 @@ function ComparisonTable({
                 <tr key={table.table} className={hasAnyTableChange(table) ? "has-change" : "clean"}>
                   <td>{table.table}</td>
                   <td className={schemaDiffers ? "warn" : "ok"}>
-                    {schemaDiffers ? `Differs (${schemaDiffCount(table)})` : "Match"}
+                    {schemaDiffers ? `Changed (${schemaDiffCount(table)})` : "Match"}
                   </td>
                   <td>{tableCount(table, "modified") || "-"}</td>
                   <td>{tableCount(table, "db1") || "-"}</td>
@@ -1155,8 +1440,17 @@ function TableDetailModal({
   db2Path: string;
   onClose: () => void;
 }) {
+  const hasSchemaDiff = schemaDiffCount(table) > 0;
   const [tab, setTab] = useState<DetailTab>(
-    tableCount(table, "modified") ? "modified" : tableCount(table, "db1") ? "db1" : tableCount(table, "db2") ? "db2" : "schema"
+    tableCount(table, "modified")
+      ? "modified"
+      : tableCount(table, "db1")
+        ? "db1"
+        : tableCount(table, "db2")
+          ? "db2"
+          : hasSchemaDiff
+            ? "schema"
+            : "complete"
   );
 
   return (
@@ -1170,13 +1464,15 @@ function TableDetailModal({
           <button onClick={onClose}>Close</button>
         </header>
         <div className="detail-tabs">
-          <button className={`${tab === "modified" ? "active" : ""} ${tableCount(table, "modified") > 0 ? "has-count" : ""}`} onClick={() => setTab("modified")}>Modified ({tableCount(table, "modified")})</button>
+          <button className={`${tab === "modified" ? "active" : ""} ${tableCount(table, "modified") > 0 ? "has-count" : ""}`} onClick={() => setTab("modified")}>Values Changed ({tableCount(table, "modified")})</button>
           <button className={`${tab === "db1" ? "active" : ""} ${tableCount(table, "db1") > 0 ? "has-count" : ""}`} onClick={() => setTab("db1")}>DB1 only ({tableCount(table, "db1")})</button>
           <button className={`${tab === "db2" ? "active" : ""} ${tableCount(table, "db2") > 0 ? "has-count" : ""}`} onClick={() => setTab("db2")}>DB2 only ({tableCount(table, "db2")})</button>
           <button className={tab === "complete" ? "active" : ""} onClick={() => setTab("complete")}>Complete Data</button>
-          <button className={`${tab === "schema" ? "active" : ""} ${schemaDiffCount(table) > 0 ? "has-count" : ""}`} onClick={() => setTab("schema")}>
-            Schema ({schemaDiffCount(table)})
-          </button>
+          {hasSchemaDiff && (
+            <button className={`${tab === "schema" ? "active" : ""} has-count`} onClick={() => setTab("schema")}>
+              Schema Change ({schemaDiffCount(table)})
+            </button>
+          )}
         </div>
         <div className="detail-content">
           {tab === "modified" && <ModifiedGrid table={table} />}
@@ -1193,11 +1489,6 @@ function TableDetailModal({
 function ModifiedGrid({ table }: { table: TableDataResult }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [filter, setFilter] = useState("");
-  const [fieldDetail, setFieldDetail] = useState<{
-    column: string;
-    db1Value: unknown;
-    db2Value: unknown;
-  } | null>(null);
   const selected = table.modified_rows[selectedIndex] ?? table.modified_rows[0];
   const totalFieldChanges = table.modified_rows.reduce((sum, row) => sum + row.column_changes.length, 0);
   const modifiedTotal = tableCount(table, "modified");
@@ -1280,9 +1571,11 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
                       <div className="long-value">{formattedValueText(db2Value)}</div>
                     </td>
                     <td>
-                      <button className="change-pill" onClick={() => setFieldDetail({ column, db1Value, db2Value })}>
-                        View change
-                      </button>
+                      <div className="change-inline">
+                        <span>{valueText(db1Value)}</span>
+                        <em>→</em>
+                        <span>{valueText(db2Value)}</span>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -1292,14 +1585,6 @@ function ModifiedGrid({ table }: { table: TableDataResult }) {
           {!visibleChanges.length && <div className="muted-block compact">No matching field changes</div>}
         </section>
       </div>
-      {fieldDetail && (
-        <FieldDetailModal
-          column={fieldDetail.column}
-          db1Value={fieldDetail.db1Value}
-          db2Value={fieldDetail.db2Value}
-          onClose={() => setFieldDetail(null)}
-        />
-      )}
     </div>
   );
 }
@@ -1324,9 +1609,14 @@ function CompleteDataView({
 
   useEffect(() => {
     let cancelled = false;
+    setLoadedDb1Rows(addSyntheticPk(table.all_db1_rows ?? []));
+    setLoadedDb2Rows(addSyntheticPk(table.all_db2_rows ?? []));
+    setDb1Total(table.all_db1_rows_count ?? table.all_db1_rows?.length ?? null);
+    setDb2Total(table.all_db2_rows_count ?? table.all_db2_rows?.length ?? null);
 
     async function loadCompleteRows() {
-      if ((table.all_db1_rows?.length || table.all_db2_rows?.length) && !cancelled) {
+      const hasEmbeddedCompleteData = table.all_db1_rows !== undefined || table.all_db2_rows !== undefined;
+      if (hasEmbeddedCompleteData && !cancelled) {
         setDb1Total(table.all_db1_rows_count ?? table.all_db1_rows?.length ?? 0);
         setDb2Total(table.all_db2_rows_count ?? table.all_db2_rows?.length ?? 0);
         setLoadStatus("Showing complete data from comparison result");
@@ -1662,7 +1952,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
   const browsePageSize = 1000;
   const [tables, setTables] = useState<string[]>([]);
   const [selectedTable, setSelectedTable] = useState("");
-  const [sql, setSql] = useState("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;");
+  const [sql, setSql] = useState("");
   const [result, setResult] = useState<SqlQueryResult | null>(null);
   const [tableColumns, setTableColumns] = useState<TableColumn[]>([]);
   const [foreignKeys, setForeignKeys] = useState<{ table: string; from: string; to: string }[]>([]);
@@ -1673,7 +1963,21 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
   const [isDbLoaded, setIsDbLoaded] = useState(false);
   const [isLoadingDb, setIsLoadingDb] = useState(false);
   const [tableFilter, setTableFilter] = useState("");
-  const [explorerTab, setExplorerTab] = useState<"browse" | "query">("browse");
+  const [explorerTab, setExplorerTab] = useState<"query" | "data" | "diagram" | "export" | "health">("data");
+  const [schema, setSchema] = useState<DatabaseSchemaResult | null>(null);
+  const [allowWrite, setAllowWrite] = useState(false);
+  const [queryLimit, setQueryLimit] = useState(1000);
+  const [exportStatus, setExportStatus] = useState("");
+  const [versionStatus, setVersionStatus] = useState("");
+  const [editorCursor, setEditorCursor] = useState(0);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const [queryError, setQueryError] = useState<{ message: string; token: string } | null>(null);
+  const [uiDensity, setUiDensity] = useState<"comfortable" | "compact">(() =>
+    (localStorage.getItem("dbcompare.sqlDensity") as "comfortable" | "compact" | null) ?? "comfortable"
+  );
+  const [accent, setAccent] = useState<"blue" | "green" | "slate">(() =>
+    (localStorage.getItem("dbcompare.sqlAccent") as "blue" | "green" | "slate" | null) ?? "blue"
+  );
   const [navigationTrail, setNavigationTrail] = useState<NavigationItem[]>([]);
   const [isLoadingMoreRows, setIsLoadingMoreRows] = useState(false);
   const [queryHistory, setQueryHistory] = useState<string[]>(() => {
@@ -1684,9 +1988,51 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     }
   });
   const [selectedRow, setSelectedRow] = useState<SelectedRowState | null>(null);
+  const [pendingEdits, setPendingEdits] = useState<BatchRowEdit[]>([]);
+  const [editStatus, setEditStatus] = useState("");
+  const [isSavingEdits, setIsSavingEdits] = useState(false);
+  const sqlEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const dataRequestIdRef = useRef(0);
   const fkByColumn = new Map(foreignKeys.map((fk) => [fk.from, fk]));
   const fkColumns = new Set(fkByColumn.keys());
   const visibleTables = tables.filter((table) => table.toLowerCase().includes(tableFilter.toLowerCase()));
+  const schemaRelations = schema?.tables.flatMap((table) =>
+    table.foreign_keys.map((fk) => ({ fromTable: table.name, from: fk.from, toTable: fk.table, to: fk.to }))
+  ) ?? [];
+  const allColumnNames = useMemo(() => {
+    const names = new Set<string>();
+    schema?.tables.forEach((table) => table.columns.forEach((column) => names.add(column.name)));
+    return Array.from(names).sort((left, right) => left.localeCompare(right));
+  }, [schema]);
+  const autocompleteToken = useMemo(() => {
+    const beforeCursor = sql.slice(0, editorCursor);
+    return beforeCursor.match(/[A-Za-z0-9_."']+$/)?.[0] ?? "";
+  }, [editorCursor, sql]);
+  const querySuggestions = useMemo(() => {
+    const normalizedToken = autocompleteToken.replace(/^["']/, "").toLowerCase();
+    if (!normalizedToken) return [];
+
+    const candidates = [
+      ...SQL_KEYWORDS.map((value) => ({ value, type: "Keyword" })),
+      ...tables.map((value) => ({ value, type: "Table" })),
+      ...allColumnNames.map((value) => ({ value, type: "Column" }))
+    ];
+    const seen = new Set<string>();
+
+    return candidates
+      .filter((candidate) => candidate.value.toLowerCase().startsWith(normalizedToken))
+      .filter((candidate) => {
+        const key = `${candidate.type}:${candidate.value}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 10);
+  }, [allColumnNames, autocompleteToken, tables]);
+  const highlightedSql = useMemo(
+    () => highlightedSqlHtml(sql, tables, allColumnNames, queryError?.token ?? ""),
+    [allColumnNames, queryError?.token, sql, tables]
+  );
 
   useEffect(() => {
     if (dbPath) {
@@ -1694,6 +2040,19 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbPath]);
+
+  useEffect(() => {
+    localStorage.setItem("dbcompare.sqlDensity", uiDensity);
+  }, [uiDensity]);
+
+  useEffect(() => {
+    localStorage.setItem("dbcompare.sqlAccent", accent);
+  }, [accent]);
+
+  useEffect(() => {
+    setActiveSuggestionIndex(0);
+  }, [autocompleteToken]);
+
 
   function saveQueryHistory(nextHistory: string[]) {
     setQueryHistory(nextHistory);
@@ -1739,6 +2098,9 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       setCheckStatus("");
       setCheckDetails([]);
       setStatus(`${data.tables.length} table(s) loaded.`);
+      databaseSchema(dbPath)
+        .then(setSchema)
+        .catch(() => setSchema(null));
 
       loadDatabaseVersion()
         .then((version) => {
@@ -1746,9 +2108,6 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
         })
         .catch(() => undefined);
 
-      if (data.tables[0]) {
-        await inspectTable(data.tables[0]);
-      }
     } catch (error) {
       setIsDbLoaded(false);
       setTables([]);
@@ -1762,7 +2121,7 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     setDbPath("");
     setTables([]);
     setSelectedTable("");
-    setSql("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;");
+    setSql("");
     setResult(null);
     setTableColumns([]);
     setForeignKeys([]);
@@ -1773,7 +2132,9 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
     setIsDbLoaded(false);
     setIsLoadingDb(false);
     setTableFilter("");
-    setExplorerTab("browse");
+    setExplorerTab("data");
+    setSchema(null);
+    setExportStatus("");
     setNavigationTrail([]);
     setSelectedRow(null);
     setIsLoadingMoreRows(false);
@@ -1822,26 +2183,43 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
   }
 
   async function inspectTable(table: string, keepTrail = false) {
+    const requestId = ++dataRequestIdRef.current;
     setSelectedTable(table);
-    setExplorerTab("browse");
+    setExplorerTab("data");
     if (!keepTrail) {
       setNavigationTrail([{ label: table, table }]);
     }
     setStatus(`Opening ${table}`);
     try {
       const [info, rows] = await Promise.all([tableInfo(dbPath, table), tableRows(dbPath, table, browsePageSize, 0)]);
+      if (requestId !== dataRequestIdRef.current) return;
       setForeignKeys(info.foreign_keys);
       setTableColumns(info.columns);
       setResult({ columns: rows.columns, rows: rows.rows, row_count: rows.row_count ?? info.row_count });
-      setSql(`SELECT * FROM "${table}" LIMIT 250;`);
       setStatus(`${table}: ${info.row_count} row(s), ${info.columns.length} column(s). Loaded ${rows.rows.length}.`);
     } catch (error) {
+      if (requestId !== dataRequestIdRef.current) return;
       setStatus(error instanceof Error ? error.message : "Unable to inspect table.");
     }
   }
 
+  function editKey(edit: Pick<BatchRowEdit, "table" | "key">) {
+    return `${edit.table}:${JSON.stringify(edit.key, Object.keys(edit.key).sort())}`;
+  }
+
+  function selectTableFromSidebar(table: string) {
+    if (explorerTab === "export") {
+      setSelectedTable(table);
+      setNavigationTrail([{ label: table, table }]);
+      setStatus(`Selected ${table} for export.`);
+      return;
+    }
+
+    inspectTable(table);
+  }
+
   async function loadMoreTableRows() {
-    if (!dbPath || !selectedTable || explorerTab !== "browse" || !result || isLoadingMoreRows) return;
+    if (!dbPath || !selectedTable || explorerTab !== "data" || !result || isLoadingMoreRows) return;
     if (result.rows.length >= result.row_count) return;
     const table = selectedTable;
     const offset = result.rows.length;
@@ -1869,42 +2247,102 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       setStatus("Select a database first.");
       return;
     }
+    if (!sql.trim()) {
+      setStatus("Enter a SQL query first.");
+      return;
+    }
+    setQueryError(null);
     setStatus("Running query");
     try {
-      const data = await executeSql(dbPath, sql);
+      const data = await executeSql(dbPath, sql, allowWrite, queryLimit);
       setResult(data);
       rememberQuery(sql);
-      setStatus(`${data.row_count} row(s) returned.`);
+      setStatus(`${data.row_count} row(s) returned${data.elapsed_ms ? ` in ${data.elapsed_ms} ms` : ""}.`);
+      if (allowWrite) {
+        databaseSchema(dbPath).then(setSchema).catch(() => undefined);
+      }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Query failed.");
+      const message = error instanceof Error ? error.message : "Query failed.";
+      setQueryError({ message, token: sqlErrorToken(message) });
+      setStatus(message);
+    }
+  }
+
+  async function saveDatabaseVersion(nextVersion: number) {
+    if (!dbPath || !Number.isInteger(nextVersion) || nextVersion < 0) {
+      setVersionStatus("Enter a valid non-negative DB version.");
+      return;
+    }
+    setVersionStatus("Saving DB version");
+    try {
+      await executeSql(dbPath, `PRAGMA user_version = ${nextVersion}`, true, 1);
+      const version = await databaseVersion(dbPath);
+      setDbVersion(version.user_version);
+      setVersionStatus("DB version saved.");
+    } catch (error) {
+      setVersionStatus(error instanceof Error ? error.message : "Unable to save DB version.");
+    }
+  }
+
+
+  async function runExport(source: ExportSource, format: ExportFormat) {
+    if (!dbPath) {
+      setExportStatus("Select a database first.");
+      return;
+    }
+    if (source === "table" && !selectedTable) {
+      setExportStatus("Select a table first.");
+      return;
+    }
+    setExportStatus("Preparing export");
+    try {
+      const response = await exportSqlData({
+        dbPath,
+        source,
+        format,
+        table: selectedTable,
+        sql,
+        limit: queryLimit
+      });
+      const saved = await window.dbcompare?.saveGeneratedFile(response.path, fileNameFromPath(response.path));
+      setExportStatus(saved?.path ? `Export saved to ${saved.path}` : `Export ready: ${response.path}`);
+    } catch (error) {
+      setExportStatus(error instanceof Error ? error.message : "Export failed.");
     }
   }
 
   async function navigateForeignKey(fk: { table: string; from: string; to: string }, value: unknown) {
     if (value === null || value === undefined || value === "") return;
-    const escaped = String(value).replace(/'/g, "''");
-    const query = `SELECT * FROM "${fk.table}" WHERE "${fk.to}" = '${escaped}' LIMIT 250;`;
+    const requestId = ++dataRequestIdRef.current;
     const sourceTable = selectedTable;
-    setExplorerTab("browse");
+    setExplorerTab("data");
     setResult(null);
     setStatus(`Opening ${fk.table} where ${fk.to} = ${valueText(value)}`);
     try {
       const [info, data] = await Promise.all([
         tableInfo(dbPath, fk.table),
-        executeSql(dbPath, query, false, 250)
+        relatedRows(dbPath, fk.table, fk.to, value, 250)
       ]);
+      if (requestId !== dataRequestIdRef.current) return;
       setSelectedTable(fk.table);
       setTableColumns(info.columns);
-      setSql(query);
+      setSql(`SELECT * FROM "${fk.table}" WHERE "${fk.to}" = ${typeof value === "number" ? value : `'${String(value).replace(/'/g, "''")}'`} LIMIT 250;`);
       setNavigationTrail((trail) => {
         const baseTrail = trail.length ? trail : sourceTable ? [{ label: sourceTable, table: sourceTable }] : [];
-        return [...baseTrail, { label: `${fk.table} (${fk.to}=${valueText(value)})`, table: fk.table, query }];
+        return [
+          ...baseTrail,
+          {
+            label: `${fk.table} (${fk.to}=${valueText(value)})`,
+            table: fk.table,
+            related: { column: fk.to, value }
+          }
+        ];
       });
       setForeignKeys(info.foreign_keys);
-      setResult({ columns: data.columns, rows: data.rows, row_count: data.row_count });
-      rememberQuery(query);
+      setResult({ columns: data.columns, rows: data.rows, row_count: data.rows.length });
       setStatus(`${data.rows.length} related row(s) found in ${fk.table} for ${fk.to} = ${valueText(value)}.`);
     } catch (error) {
+      if (requestId !== dataRequestIdRef.current) return;
       setResult({ columns: [], rows: [], row_count: 0 });
       setStatus(error instanceof Error ? error.message : "Unable to open related row.");
     }
@@ -1912,45 +2350,141 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
 
   function insertSnippet(snippet: string) {
     setSql((current) => {
-      if (snippet === "SELECT *" && selectedTable) return `SELECT * FROM "${selectedTable}" LIMIT 100;`;
-      if (snippet === "COUNT(*)" && selectedTable) return `SELECT COUNT(*) AS total FROM "${selectedTable}";`;
-      if (snippet === "LIMIT 100") return current.trim().replace(/;$/, "") + " LIMIT 100;";
-      return current;
+      if (snippet === "SELECT *" && selectedTable) return `SELECT * FROM ${selectedTable};`;
+      if (snippet === "COUNT(*)" && selectedTable) return `SELECT COUNT(*) AS total FROM ${selectedTable};`;
+      if (snippet === "WHERE") return `${current.trim().replace(/;$/, "")}\nWHERE `;
+      if (snippet === "JOIN") return `${current.trim().replace(/;$/, "")}\nJOIN  ON `;
+      if (snippet === "GROUP BY") return `${current.trim().replace(/;$/, "")}\nGROUP BY `;
+      if (snippet === "ORDER BY") return `${current.trim().replace(/;$/, "")}\nORDER BY `;
+      if (snippet === "INSERT") return selectedTable ? `INSERT INTO ${selectedTable} () VALUES ();` : "INSERT INTO  () VALUES ();";
+      if (snippet === "UPDATE") return selectedTable ? `UPDATE ${selectedTable} SET  WHERE ;` : "UPDATE  SET  WHERE ;";
+      if (snippet === "DELETE") return selectedTable ? `DELETE FROM ${selectedTable} WHERE ;` : "DELETE FROM  WHERE ;";
+      return `${current}${current.endsWith(" ") || !current ? "" : " "}${snippet} `;
     });
   }
 
+  function prettifyQuery() {
+    const formatted = formatSqlText(sql);
+    setSql(formatted);
+    setEditorCursor(formatted.length);
+    requestAnimationFrame(() => {
+      sqlEditorRef.current?.focus();
+      sqlEditorRef.current?.setSelectionRange(formatted.length, formatted.length);
+    });
+  }
+
+
+  function updateEditorCursor(target: HTMLTextAreaElement) {
+    setEditorCursor(target.selectionStart ?? 0);
+  }
+
+  function applyQuerySuggestion(value: string) {
+    const editor = sqlEditorRef.current;
+    const cursor = editor?.selectionStart ?? editorCursor;
+    const beforeCursor = sql.slice(0, cursor);
+    const afterCursor = sql.slice(cursor);
+    const tokenMatch = beforeCursor.match(/[A-Za-z0-9_."']+$/);
+    const tokenStart = tokenMatch ? cursor - tokenMatch[0].length : cursor;
+    const nextValue = value;
+    const nextSql = `${sql.slice(0, tokenStart)}${nextValue}${afterCursor}`;
+    const nextCursor = tokenStart + nextValue.length;
+
+    setSql(nextSql);
+    setEditorCursor(nextCursor);
+    setActiveSuggestionIndex(0);
+    requestAnimationFrame(() => {
+      sqlEditorRef.current?.focus();
+      sqlEditorRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
+  function handleSqlKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      runSql();
+      return;
+    }
+
+    if (!querySuggestions.length) return;
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveSuggestionIndex((index) => (index + 1) % querySuggestions.length);
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveSuggestionIndex((index) => (index - 1 + querySuggestions.length) % querySuggestions.length);
+      return;
+    }
+
+    if (event.key === "Tab" || event.key === "Enter") {
+      event.preventDefault();
+      applyQuerySuggestion(querySuggestions[activeSuggestionIndex]?.value ?? querySuggestions[0].value);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      setEditorCursor(0);
+    }
+  }
+
   async function openTrailItem(item: NavigationItem, index: number) {
-    setExplorerTab("browse");
+    const requestId = ++dataRequestIdRef.current;
+    setExplorerTab("data");
     setResult(null);
     setStatus(`Opening ${item.label}`);
     try {
       const [info, data] = await Promise.all([
         tableInfo(dbPath, item.table),
-        item.query ? executeSql(dbPath, item.query, false, 250) : tableRows(dbPath, item.table, browsePageSize, 0)
+        item.related
+          ? relatedRows(dbPath, item.table, item.related.column, item.related.value, 250)
+          : item.query
+            ? executeSql(dbPath, item.query, false, 250)
+            : tableRows(dbPath, item.table, browsePageSize, 0)
       ]);
+      if (requestId !== dataRequestIdRef.current) return;
+      const nextRowCount = "row_count" in data ? data.row_count : data.rows.length;
       setSelectedTable(item.table);
       setForeignKeys(info.foreign_keys);
       setTableColumns(info.columns);
-      setResult({ columns: data.columns, rows: data.rows, row_count: data.row_count ?? data.rows.length });
-      setSql(item.query ?? `SELECT * FROM "${item.table}" LIMIT 250;`);
+      setResult({ columns: data.columns, rows: data.rows, row_count: nextRowCount });
+      setSql(
+        item.query ??
+          (item.related
+            ? `SELECT * FROM "${item.table}" WHERE "${item.related.column}" = ${typeof item.related.value === "number" ? item.related.value : `'${String(item.related.value).replace(/'/g, "''")}'`} LIMIT 250;`
+            : `SELECT * FROM "${item.table}" LIMIT 250;`)
+      );
       setNavigationTrail((trail) => trail.slice(0, index + 1));
       setStatus(`${item.label}: ${data.rows.length} row(s).`);
     } catch (error) {
+      if (requestId !== dataRequestIdRef.current) return;
       setResult({ columns: [], rows: [], row_count: 0 });
       setStatus(error instanceof Error ? error.message : "Unable to open breadcrumb item.");
     }
   }
 
-  async function saveRowEdit(
+  async function stageRowEdit(
     key: Record<string, unknown>,
     values: Record<string, unknown>
-  ): Promise<RowUpdateResult> {
-    if (!dbPath || !selectedTable) {
-      throw new Error("Select a database table before saving.");
+  ): Promise<void> {
+    if (!selectedTable) {
+      throw new Error("Select a database table before editing.");
     }
 
-    const response = await updateRow(dbPath, selectedTable, key, values);
-    const nextRow = response.row ?? { ...(selectedRow?.row ?? {}), ...values };
+    const nextRow = { ...(selectedRow?.row ?? {}), ...values };
+    const nextEdit: BatchRowEdit = { table: selectedTable, key, values };
+    const nextEditKey = editKey(nextEdit);
+    setPendingEdits((current) => {
+      const existing = current.find((edit) => editKey(edit) === nextEditKey);
+      if (!existing) return [...current, nextEdit];
+      return current.map((edit) =>
+        editKey(edit) === nextEditKey
+          ? { ...edit, values: { ...edit.values, ...values } }
+          : edit
+      );
+    });
     setResult((current) => {
       if (!current) return current;
       return {
@@ -1962,35 +2496,61 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
       row: nextRow,
       key: makeEditableRowKey(nextRow, tableColumns, result?.columns ?? Object.keys(nextRow))
     });
-    setStatus(
-      response.mode === "repacked"
-        ? "Row edited. Save the generated .vyb copy to keep archive changes."
-        : "Row edited and saved directly."
-    );
-    return response;
+    setEditStatus("Change staged. Save and download the edited DB when finished.");
+  }
+
+  async function saveAndDownloadEditedDb() {
+    if (!dbPath || !pendingEdits.length || isSavingEdits) return;
+    setIsSavingEdits(true);
+    setEditStatus("Creating edited database");
+    try {
+      const response = await updateRowsBatch(dbPath, pendingEdits);
+      const saved = await window.dbcompare?.saveGeneratedFile(response.path, fileNameFromPath(response.path));
+      setEditStatus(saved?.path ? `Edited DB saved to ${saved.path}` : `Edited DB ready: ${response.path}`);
+      if (saved?.saved) {
+        setPendingEdits([]);
+      }
+    } catch (error) {
+      setEditStatus(error instanceof Error ? error.message : "Unable to save edited database.");
+    } finally {
+      setIsSavingEdits(false);
+    }
+  }
+
+  function clearPendingEdits() {
+    setPendingEdits([]);
+    setEditStatus("Pending edits cleared. Reload the table to discard previewed cell changes.");
   }
 
   return (
     <>
-      <section className="compare-form">
-        <div className="form-card input-card sql-input-card">
-          <PathPicker label="Database" value={dbPath} onChange={setDbPath} />
-          <button className="reset-button" onClick={resetExplorer} disabled={isLoadingDb}>
-            <RotateCcw size={16} /> Reset
-          </button>
-        </div>
-        {isDbLoaded && (
-          <div className="db-info-strip">
-            <span>{tables.length} table(s)</span>
-            <span>DB Version: {dbVersion ?? "-"}</span>
-            <button onClick={() => setExplorerTab("query")}>
-              <Play size={15} /> Execute query
-            </button>
-            <button onClick={() => runDatabaseCheck("integrity")}>Integrity check</button>
-            <button onClick={() => runDatabaseCheck("foreign")}>Foreign-key check</button>
-            {checkStatus && !/not found/i.test(checkStatus) && <strong>{checkStatus}</strong>}
+      <section className={`sql-workbench ${uiDensity} accent-${accent}`}>
+        <header className="sql-topbar">
+          <div className="sql-tabs">
+            {[
+              ["data", "Data", Table2],
+              ["diagram", "DB Diagram", Network],
+              ["query", "Run Query", Code2],
+              ["health", "Health", CheckCircle2],
+              ["export", "Export", FileDown]
+            ].map(([tab, label, Icon]) => {
+              const TabIcon = Icon as typeof Code2;
+              return (
+                <button key={String(tab)} className={explorerTab === tab ? "active" : ""} onClick={() => setExplorerTab(tab as typeof explorerTab)}>
+                  <TabIcon size={15} /> {String(label)}
+                </button>
+              );
+            })}
           </div>
-        )}
+          <div className="sql-top-actions">
+            <button title="Reset" onClick={resetExplorer} disabled={isLoadingDb}>
+              <RotateCcw size={16} />
+            </button>
+          </div>
+        </header>
+        <div className="sql-source-row">
+          <PathPicker label="Database" value={dbPath} onChange={setDbPath} />
+        </div>
       </section>
       {!isDbLoaded ? (
         <section className="sql-empty-start">
@@ -2005,52 +2565,99 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
           </div>
         </section>
       ) : (
-      <section className="sql-grid">
-        <section className="panel table-browser">
-          <div className="panel-title">
-            <Table2 size={18} />
-            <strong>Tables</strong>
-            <span>{tables.length}</span>
-          </div>
-          <div className="table-search">
-            <Search size={16} />
-            <input value={tableFilter} onChange={(event) => setTableFilter(event.target.value)} placeholder="Search tables" />
-          </div>
-          <div className="table-list">
-            {visibleTables.map((table) => (
-              <button key={table} className={table === selectedTable ? "selected" : ""} onClick={() => inspectTable(table)}>
-                <Table2 size={17} />
-                <span>{table}</span>
-              </button>
-            ))}
-          </div>
-        </section>
+      <section className={`sql-grid sql-workbench-body ${uiDensity} accent-${accent} ${explorerTab === "diagram" ? "diagram-mode" : ""} ${explorerTab === "query" ? "query-mode" : ""} ${explorerTab === "health" ? "health-mode" : ""}`}>
+        {explorerTab !== "diagram" && explorerTab !== "query" && explorerTab !== "health" && (
+          <section className="panel table-browser">
+            <div className="panel-title">
+              <Table2 size={18} />
+              <strong>Objects</strong>
+              <span>{tables.length}</span>
+            </div>
+            <div className="table-search">
+              <Search size={16} />
+              <input value={tableFilter} onChange={(event) => setTableFilter(event.target.value)} placeholder="Search tables or columns" />
+            </div>
+            <div className="table-list">
+              {visibleTables.map((table) => (
+                <button key={table} className={table === selectedTable ? "selected" : ""} onClick={() => selectTableFromSidebar(table)} title={table}>
+                  <Table2 size={17} />
+                  <span>{table}</span>
+                  <small>{schema?.tables.find((item) => item.name === table)?.row_count ?? ""}</small>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
         <section className="panel sql-panel">
-          <div className="explorer-tabs single">
-            <button className={explorerTab === "browse" ? "active" : ""} onClick={() => setExplorerTab("browse")}>
-              Browse Data
-            </button>
-          </div>
           {explorerTab === "query" ? (
             <>
               <div className="editor-bar">
                 <div>
-                  <strong>SQL Console</strong>
-                  <span>{selectedTable || "No table selected"}</span>
+                  <strong>SQL Query Editor</strong>
+                  <span>{selectedTable ? `Active table: ${selectedTable}` : "Write SQL against the selected database"} · Ctrl/Cmd + Enter to run</span>
                 </div>
                 <div className="editor-actions">
-                  <button onClick={() => insertSnippet("SELECT *")}>SELECT *</button>
-                  <button onClick={() => insertSnippet("COUNT(*)")}>COUNT(*)</button>
-                  <button onClick={() => insertSnippet("LIMIT 100")}>LIMIT 100</button>
+                  <button onClick={prettifyQuery}>Prettify</button>
+                  <label className="sql-toggle">
+                    <input type="checkbox" checked={allowWrite} onChange={(event) => setAllowWrite(event.target.checked)} />
+                    Write
+                  </label>
+                  <label className="sql-limit">
+                    Limit
+                    <input type="number" min={1} max={10000} value={queryLimit} onChange={(event) => setQueryLimit(Number(event.target.value) || 1000)} />
+                  </label>
+                  <button className="primary" onClick={runSql}>
+                    <Play size={15} /> Run Query
+                  </button>
                   <button className="ghost-button" onClick={() => setSql("")}>
                     <RefreshCcw size={16} /> Clear
                   </button>
                 </div>
               </div>
-              <textarea value={sql} onChange={(event) => setSql(event.target.value)} spellCheck={false} />
-              <button className="floating-run" title="Execute query" onClick={runSql}>
-                <Play size={20} />
-              </button>
+              <div className="sql-editor-wrap">
+                <pre className="sql-highlight" aria-hidden="true" dangerouslySetInnerHTML={{ __html: highlightedSql }} />
+                <textarea
+                  ref={sqlEditorRef}
+                  className="sql-editor"
+                  value={sql}
+                  onChange={(event) => {
+                    setSql(event.target.value);
+                    updateEditorCursor(event.target);
+                  }}
+                  onClick={(event) => updateEditorCursor(event.currentTarget)}
+                  onKeyUp={(event) => updateEditorCursor(event.currentTarget)}
+                  onKeyDown={handleSqlKeyDown}
+                  spellCheck={false}
+                />
+                <div className="sql-inline-snippets">
+                  {SQL_SNIPPETS.map((snippet) => (
+                    <button key={snippet} onClick={() => insertSnippet(snippet)}>{snippet}</button>
+                  ))}
+                </div>
+                {querySuggestions.length > 0 && (
+                  <div className="sql-suggestions">
+                    {querySuggestions.map((suggestion, index) => (
+                      <button
+                        key={`${suggestion.type}-${suggestion.value}`}
+                        className={index === activeSuggestionIndex ? "active" : ""}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          applyQuerySuggestion(suggestion.value);
+                        }}
+                      >
+                        <strong>{suggestion.value}</strong>
+                        <span>{suggestion.type}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {queryError && (
+                  <div className="sql-inline-error">
+                    <AlertTriangle size={15} />
+                    <span>{queryError.token ? `Near "${queryError.token}": ${queryError.message}` : queryError.message}</span>
+                  </div>
+                )}
+              </div>
               <div className="query-history">
                 <span>Recent queries</span>
                 <div>
@@ -2064,13 +2671,45 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
               </div>
             </>
           ) : (
-            <div className="browse-heading compact">
-              <span>
-                {selectedTable
-                  ? `${selectedTable} - ${result?.row_count ?? 0} row(s)${result ? `, loaded ${result.rows.length}` : ""}`
-                  : "Select a table"}
-              </span>
-            </div>
+            <>
+              {explorerTab === "data" && (
+                <div className="browse-heading compact">
+                  <strong>{selectedTable || "Select a table"}</strong>
+                </div>
+              )}
+              {explorerTab === "data" && pendingEdits.length > 0 && (
+                <div className="pending-edit-bar">
+                  <span>{pendingEdits.length} staged row edit(s)</span>
+                  {editStatus && <strong>{editStatus}</strong>}
+                  <button onClick={saveAndDownloadEditedDb} disabled={isSavingEdits}>
+                    <Download size={15} /> {isSavingEdits ? "Saving..." : "Save & Download Edited DB"}
+                  </button>
+                  <button onClick={clearPendingEdits} disabled={isSavingEdits}>Clear</button>
+                </div>
+              )}
+              {explorerTab === "diagram" && (
+                <SchemaDiagram schema={schema} selectedTable={selectedTable} relations={schemaRelations} />
+              )}
+              {explorerTab === "export" && (
+                <ExportPanel
+                  selectedTable={selectedTable}
+                  status={exportStatus}
+                  onExport={runExport}
+                />
+              )}
+              {explorerTab === "health" && (
+                <HealthPanel
+                  checkStatus={checkStatus}
+                  checkDetails={checkDetails}
+                  onIntegrity={() => runDatabaseCheck("integrity")}
+                  onForeign={() => runDatabaseCheck("foreign")}
+                  schema={schema}
+                  dbVersion={dbVersion}
+                  versionStatus={versionStatus}
+                  onSaveVersion={saveDatabaseVersion}
+                />
+              )}
+            </>
           )}
           {navigationTrail.length > 1 && (
             <div className="fk-trail">
@@ -2092,24 +2731,40 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
               </div>
             </div>
           )}
-          {explorerTab === "query" && <div className="sql-status">{status}</div>}
-          <ResultTable
-            result={result}
-            tableKey={`${explorerTab}:${selectedTable}`}
-            fkColumns={fkColumns}
-            fkByColumn={fkByColumn}
-            onOpenRow={(row) => {
-              if (!result) return;
-              setSelectedRow({
-                row,
-                key: makeEditableRowKey(row, tableColumns, result.columns)
-              });
-            }}
-            onNavigateForeignKey={navigateForeignKey}
-            onLoadMore={loadMoreTableRows}
-            canLoadMore={explorerTab === "browse" && Boolean(result && result.rows.length < result.row_count)}
-            isLoadingMore={isLoadingMoreRows}
-          />
+          {(explorerTab === "query" || explorerTab === "data") && (
+            <>
+              {explorerTab === "query" && (
+                <div className="sql-status">
+                  <span>{status}</span>
+                  {result?.truncated && <strong>Limited at {result.truncated_at} rows</strong>}
+                </div>
+              )}
+              <ResultTable
+                result={result}
+                tableKey={`${explorerTab}:${selectedTable}`}
+                fkColumns={fkColumns}
+                fkByColumn={fkByColumn}
+                onOpenRow={(row) => {
+                  if (!result) return;
+                  setSelectedRow({
+                    row,
+                    key: makeEditableRowKey(row, tableColumns, result.columns)
+                  });
+                }}
+                onNavigateForeignKey={navigateForeignKey}
+                onLoadMore={loadMoreTableRows}
+                canLoadMore={explorerTab === "data" && Boolean(result && result.rows.length < result.row_count)}
+                isLoadingMore={isLoadingMoreRows}
+              />
+            </>
+          )}
+          {explorerTab === "query" && (
+            <div className="sql-bottom-bar">
+              <span>Connected</span>
+              <span>{result?.row_count ?? 0} rows</span>
+              <span>{result?.elapsed_ms ?? "-"} ms</span>
+            </div>
+          )}
         </section>
       </section>
       )}
@@ -2118,12 +2773,534 @@ function SqlExplorer({ dbPath, setDbPath }: { dbPath: string; setDbPath: (path: 
           row={selectedRow.row}
           rowKey={selectedRow.key}
           table={selectedTable}
-          canEdit={explorerTab === "browse" && Boolean(selectedTable)}
-          onSave={saveRowEdit}
+          canEdit={explorerTab === "data" && Boolean(selectedTable)}
+          onSave={stageRowEdit}
           onClose={() => setSelectedRow(null)}
         />
       )}
     </>
+  );
+}
+
+function SchemaDiagram({
+  schema,
+  selectedTable,
+  relations
+}: {
+  schema: DatabaseSchemaResult | null;
+  selectedTable: string;
+  relations: { fromTable: string; from: string; toTable: string; to: string }[];
+}) {
+  const [focusedTable, setFocusedTable] = useState(selectedTable);
+  const [zoom, setZoom] = useState(0.85);
+
+  useEffect(() => {
+    setFocusedTable("");
+  }, [schema]);
+
+  const tableByName = useMemo(() => new Map(schema?.tables.map((table) => [table.name, table]) ?? []), [schema]);
+
+  if (!schema) return <div className="muted-block">Schema is loading</div>;
+
+  const tables = schema.tables.filter((table) => table.type === "table");
+  const tableNames = new Set(tables.map((table) => table.name));
+  const validRelations = relations.filter((relation) => tableNames.has(relation.fromTable) && tableNames.has(relation.toTable));
+  const activeTable = focusedTable && tableNames.has(focusedTable) ? focusedTable : "";
+  const activeRelations = activeTable
+    ? validRelations.filter((relation) => relation.fromTable === activeTable || relation.toTable === activeTable)
+    : validRelations;
+  const relationCounts = new Map<string, number>();
+  const relationColors = ["#497fbd", "#0f9f8f", "#9b6bca", "#d78137", "#d05f7a", "#6875d1", "#3b8a54", "#b65f3b"];
+
+  validRelations.forEach((relation) => {
+    relationCounts.set(relation.fromTable, (relationCounts.get(relation.fromTable) ?? 0) + 1);
+    relationCounts.set(relation.toTable, (relationCounts.get(relation.toTable) ?? 0) + 1);
+  });
+
+  const visibleTableNames = activeTable
+    ? [activeTable, ...Array.from(new Set(activeRelations.flatMap((relation) => [relation.fromTable, relation.toTable]))).filter((name) => name !== activeTable)]
+    : tables
+        .slice()
+        .sort((left, right) => (relationCounts.get(right.name) ?? 0) - (relationCounts.get(left.name) ?? 0) || left.name.localeCompare(right.name))
+        .slice(0, 36)
+        .map((table) => table.name);
+
+  const visibleSet = new Set(visibleTableNames);
+  const visibleRelations = (activeTable ? activeRelations : validRelations).filter(
+    (relation) => visibleSet.has(relation.fromTable) && visibleSet.has(relation.toTable)
+  );
+  const pairIndexes = new Map<string, number>();
+  const pairTotals = new Map<string, number>();
+
+  visibleRelations.forEach((relation) => {
+    const pairKey = [relation.fromTable, relation.toTable].sort().join("__");
+    pairTotals.set(pairKey, (pairTotals.get(pairKey) ?? 0) + 1);
+  });
+
+  const incomingByTable = new Map<string, typeof visibleRelations>();
+  const outgoingByTable = new Map<string, typeof visibleRelations>();
+
+  visibleRelations.forEach((relation) => {
+    incomingByTable.set(relation.toTable, [...(incomingByTable.get(relation.toTable) ?? []), relation]);
+    outgoingByTable.set(relation.fromTable, [...(outgoingByTable.get(relation.fromTable) ?? []), relation]);
+  });
+
+  const CARD_WIDTH = 340;
+  const HEADER_HEIGHT = 52;
+  const ROW_HEIGHT = 38;
+  const COLUMN_GAP = 560;
+  const ROW_GAP = 120;
+  const CANVAS_PADDING = 90;
+
+  const visibleTables = visibleTableNames
+    .map((name) => tableByName.get(name))
+    .filter((table): table is NonNullable<ReturnType<typeof tableByName.get>> => Boolean(table));
+
+  const getDisplayColumns = (table: (typeof visibleTables)[number]) => {
+    const relationColumns = new Set(
+      visibleRelations
+        .filter((relation) => relation.fromTable === table.name || relation.toTable === table.name)
+        .flatMap((relation) => [
+          relation.fromTable === table.name ? relation.from : "",
+          relation.toTable === table.name ? relation.to : ""
+        ])
+        .filter(Boolean)
+    );
+    const priorityColumns = table.columns.filter((column) => column.pk || relationColumns.has(column.name));
+    const remainingColumns = table.columns.filter((column) => !priorityColumns.some((item) => item.name === column.name));
+    const visibleColumnCount = Math.max(priorityColumns.length, Math.max(7, Math.min(12, table.columns.length)));
+    return [...priorityColumns, ...remainingColumns].slice(0, visibleColumnCount);
+  };
+
+  const columnLists = new Map(visibleTables.map((table) => [table.name, getDisplayColumns(table)]));
+  const cardHeights = new Map(
+    visibleTables.map((table) => {
+      const columns = columnLists.get(table.name) ?? [];
+      return [table.name, HEADER_HEIGHT + columns.length * ROW_HEIGHT + (table.columns.length > columns.length ? 32 : 0)];
+    })
+  );
+
+  const focused = activeTable ? visibleTables.filter((table) => table.name === activeTable) : [];
+  const parentTables = activeTable
+    ? visibleTables.filter((table) => visibleRelations.some((relation) => relation.fromTable === activeTable && relation.toTable === table.name))
+    : [];
+  const childTables = activeTable
+    ? visibleTables.filter((table) => visibleRelations.some((relation) => relation.toTable === activeTable && relation.fromTable === table.name))
+    : [];
+  const peerTables = activeTable
+    ? visibleTables.filter((table) => table.name !== activeTable && !parentTables.includes(table) && !childTables.includes(table))
+    : [];
+  const leftTables = activeTable
+    ? parentTables
+    : visibleTables.filter((table) => !(incomingByTable.get(table.name)?.length ?? 0));
+  const middleTables = !activeTable
+    ? visibleTables.filter((table) => (incomingByTable.get(table.name)?.length ?? 0) && (outgoingByTable.get(table.name)?.length ?? 0))
+    : [];
+  const rightTables = activeTable
+    ? [...childTables, ...peerTables]
+    : visibleTables.filter((table) => !leftTables.includes(table) && !middleTables.includes(table));
+  const fallbackSplit = Math.ceil(visibleTables.length / 2);
+  const layoutColumns = activeTable
+    ? [leftTables, focused, rightTables].filter((column) => column.length)
+    : leftTables.length || middleTables.length || rightTables.length
+      ? [leftTables, middleTables, rightTables].filter((column) => column.length)
+      : [visibleTables.slice(0, fallbackSplit), visibleTables.slice(fallbackSplit)].filter((column) => column.length);
+  const positionedTables = new Map<string, { x: number; y: number; width: number; height: number }>();
+  let canvasHeight = 0;
+
+  layoutColumns.forEach((columnTables, columnIndex) => {
+    let y = CANVAS_PADDING;
+    columnTables.forEach((table) => {
+      const height = cardHeights.get(table.name) ?? HEADER_HEIGHT;
+      positionedTables.set(table.name, {
+        x: CANVAS_PADDING + columnIndex * COLUMN_GAP,
+        y,
+        width: CARD_WIDTH,
+        height
+      });
+      y += height + ROW_GAP;
+    });
+    canvasHeight = Math.max(canvasHeight, y + CANVAS_PADDING);
+  });
+
+  const canvasWidth = Math.max(980, CANVAS_PADDING * 2 + Math.max(1, layoutColumns.length) * CARD_WIDTH + Math.max(0, layoutColumns.length - 1) * (COLUMN_GAP - CARD_WIDTH));
+  canvasHeight = Math.max(600, canvasHeight);
+
+  const columnAnchor = (tableName: string, columnName: string, side: "left" | "right") => {
+    const position = positionedTables.get(tableName);
+    const columns = columnLists.get(tableName) ?? [];
+    if (!position) return { x: 0, y: 0 };
+      const columnIndex = Math.max(0, columns.findIndex((column) => column.name === columnName));
+      return {
+        x: side === "left" ? position.x : position.x + position.width,
+        y: position.y + HEADER_HEIGHT + columnIndex * ROW_HEIGHT + ROW_HEIGHT / 2
+      };
+  };
+
+  const selectedRelationKeys = new Set(visibleRelations.map((relation) => `${relation.fromTable}.${relation.from}->${relation.toTable}.${relation.to}`));
+  const updateZoom = (nextZoom: number) => setZoom(Math.min(1.4, Math.max(0.45, Number(nextZoom.toFixed(2)))));
+
+  return (
+    <div className="schema-workspace diagram-full">
+      <div className="schema-graph-shell">
+        <div className="schema-graph-toolbar">
+          <div>
+            <strong>{activeTable ? `${activeTable} relationships` : "Database relationships"}</strong>
+            <span>{visibleRelations.length ? `${visibleRelations.length} connection(s) shown` : "No foreign-key links found"}</span>
+          </div>
+          <label className="schema-table-select">
+            <Table2 size={15} />
+            <select value={activeTable} onChange={(event) => setFocusedTable(event.target.value)}>
+              <option value="">All relationship tables</option>
+              {tables.map((table) => (
+                <option key={table.name} value={table.name}>{table.name}</option>
+              ))}
+            </select>
+          </label>
+          <div className="schema-zoom-controls">
+            <button onClick={() => updateZoom(zoom - 0.1)} title="Zoom out" aria-label="Zoom out"><Minus size={16} /></button>
+            <span>{Math.round(zoom * 100)}%</span>
+            <button onClick={() => updateZoom(zoom + 0.1)} title="Zoom in" aria-label="Zoom in"><Plus size={16} /></button>
+            <button onClick={() => updateZoom(0.85)} title="Reset zoom" aria-label="Reset zoom"><RotateCcw size={16} /></button>
+            <button onClick={() => setFocusedTable("")} disabled={!activeTable} title="Show all tables" aria-label="Show all tables"><Network size={16} /></button>
+          </div>
+        </div>
+        <div className="schema-graph-canvas" style={{ minWidth: canvasWidth * zoom, minHeight: canvasHeight * zoom }}>
+          <div className="schema-graph-stage" style={{ width: canvasWidth, height: canvasHeight, transform: `scale(${zoom})` }}>
+          <svg className="schema-links" width={canvasWidth} height={canvasHeight} viewBox={`0 0 ${canvasWidth} ${canvasHeight}`}>
+            <defs>
+              {relationColors.map((color, index) => (
+                <marker key={color} id={`schema-arrow-${index}`} viewBox="0 0 14 14" refX="12" refY="7" markerWidth="12" markerHeight="12" orient="auto">
+                  <path d="M2 2 L12 7 L2 12 Z" fill={color} />
+                </marker>
+              ))}
+            </defs>
+            {visibleRelations.map((relation, index) => {
+              const parent = positionedTables.get(relation.toTable);
+              const child = positionedTables.get(relation.fromTable);
+              if (!parent || !child) return null;
+
+              const parentIsLeft = parent.x <= child.x;
+              const start = columnAnchor(relation.toTable, relation.to, parentIsLeft ? "right" : "left");
+              const end = columnAnchor(relation.fromTable, relation.from, parentIsLeft ? "left" : "right");
+              const pairKey = [relation.fromTable, relation.toTable].sort().join("__");
+              const pairIndex = pairIndexes.get(pairKey) ?? 0;
+              const pairTotal = pairTotals.get(pairKey) ?? 1;
+              pairIndexes.set(pairKey, pairIndex + 1);
+              const colorIndex = index % relationColors.length;
+              const color = relationColors[colorIndex];
+              const laneOffset = (pairIndex - (pairTotal - 1) / 2) * 46;
+              const routeDirection = parentIsLeft ? 1 : -1;
+              const startStub = start.x + routeDirection * (42 + Math.abs(laneOffset) * 0.12);
+              const endStub = end.x - routeDirection * 42;
+              const openSpaceMid = (startStub + endStub) / 2;
+              const laneX = openSpaceMid + laneOffset;
+              const path = `M ${start.x} ${start.y} H ${startStub} H ${laneX} V ${end.y} H ${endStub} H ${end.x}`;
+              const key = `${relation.fromTable}.${relation.from}->${relation.toTable}.${relation.to}`;
+
+              return (
+                <g key={key} className={selectedRelationKeys.has(key) ? "schema-link active" : "schema-link"} style={{ "--relation-color": color } as CSSProperties}>
+                  <path d={path} markerEnd={`url(#schema-arrow-${colorIndex})`} />
+                  <circle cx={start.x} cy={start.y} r="5" />
+                  <text x={start.x + (parentIsLeft ? 12 : -28)} y={start.y - 8}>1</text>
+                  <text className="many-label" x={end.x + (parentIsLeft ? -32 : 12)} y={end.y - 10}>*</text>
+                </g>
+              );
+            })}
+          </svg>
+          {visibleTables.map((table) => {
+            const position = positionedTables.get(table.name);
+            const displayColumns = columnLists.get(table.name) ?? [];
+            const relatedColumns = new Set(
+              visibleRelations
+                .filter((relation) => relation.fromTable === table.name || relation.toTable === table.name)
+                .flatMap((relation) => [
+                  relation.fromTable === table.name ? relation.from : "",
+                  relation.toTable === table.name ? relation.to : ""
+                ])
+                .filter(Boolean)
+            );
+            if (!position) return null;
+
+            return (
+              <button
+                key={table.name}
+                type="button"
+                className={`schema-table-card ${table.name === activeTable ? "focused" : ""}`}
+                style={{ left: position.x, top: position.y, width: position.width }}
+                onClick={() => setFocusedTable(table.name)}
+                title={`Focus ${table.name} relationships`}
+              >
+                <strong><Table2 size={16} /> {table.name}</strong>
+                {displayColumns.map((column) => {
+                  const isForeignKey = table.foreign_keys.some((fk) => fk.from === column.name);
+                  const isRelated = relatedColumns.has(column.name);
+
+                  return (
+                    <span key={column.name} className={`${column.pk ? "pk" : ""} ${isForeignKey ? "fk" : ""} ${isRelated ? "connected" : ""}`}>
+                      <b>{column.pk ? "PK" : isForeignKey ? <Link2 size={14} /> : ""}</b>
+                      <em>{column.name}</em>
+                      <small>{column.type || "TEXT"}{column.notnull ? " NN" : ""}</small>
+                    </span>
+                  );
+                })}
+                {table.columns.length > displayColumns.length && <i>+{table.columns.length - displayColumns.length} more columns</i>}
+              </button>
+            );
+          })}
+          {!validRelations.length && <div className="schema-empty-graph">No foreign-key references were found in this database.</div>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportPanel({
+  selectedTable,
+  status,
+  onExport
+}: {
+  selectedTable: string;
+  status: string;
+  onExport: (source: ExportSource, format: ExportFormat) => void;
+}) {
+  const [scope, setScope] = useState<"table" | "database">("table");
+  const dataSource = scope === "table" ? "table" : "database";
+  return (
+    <div className="export-suite">
+      <header>
+        <div>
+          <strong>Export</strong>
+          <span>{selectedTable ? `Selected table: ${selectedTable}` : "Choose a table or export the whole database"}</span>
+        </div>
+        {status && <b>{status}</b>}
+      </header>
+      <div className="export-scope">
+        <button className={scope === "table" ? "active" : ""} onClick={() => setScope("table")} disabled={!selectedTable}>
+          Specific table
+        </button>
+        <button className={scope === "database" ? "active" : ""} onClick={() => setScope("database")}>
+          Full database
+        </button>
+      </div>
+      <div className="export-grid">
+        <button onClick={() => onExport(dataSource, "csv")} disabled={scope === "table" && !selectedTable}>
+          <FileDown size={20} />
+          <strong>CSV With Data</strong>
+          <span>{scope === "table" ? "Selected table as CSV." : "ZIP with one CSV per table."}</span>
+        </button>
+        <button onClick={() => onExport(dataSource, "sql")} disabled={scope === "table" && !selectedTable}>
+          <Database size={20} />
+          <strong>Insert SQL With Data</strong>
+          <span>{scope === "table" ? "INSERT script for selected table." : "Schema plus INSERT data for all tables."}</span>
+        </button>
+        <button onClick={() => onExport("schema", "sql")}>
+          <Code2 size={20} />
+          <strong>Export Schema</strong>
+          <span>Complete database schema without table data.</span>
+        </button>
+        <button onClick={() => onExport("database", "sqlite")}>
+          <SaveIcon />
+          <strong>SQLite Copy</strong>
+          <span>Plain database file export.</span>
+        </button>
+        <button onClick={() => onExport("database", "vyp")}>
+          <Database size={20} />
+          <strong>VYP Copy</strong>
+          <span>Extracted Vyapar database format.</span>
+        </button>
+        <button onClick={() => onExport("database", "vyb")}>
+          <Database size={20} />
+          <strong>VYB Archive</strong>
+          <span>Repacked archive for sharing or restore.</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SaveIcon() {
+  return <Download size={20} />;
+}
+
+function HealthPanel({
+  checkStatus,
+  checkDetails,
+  onIntegrity,
+  onForeign,
+  schema,
+  dbVersion,
+  versionStatus,
+  onSaveVersion
+}: {
+  checkStatus: string;
+  checkDetails: Record<string, unknown>[];
+  onIntegrity: () => void;
+  onForeign: () => void;
+  schema: DatabaseSchemaResult | null;
+  dbVersion: number | null;
+  versionStatus: string;
+  onSaveVersion: (version: number) => void;
+}) {
+  const [draftVersion, setDraftVersion] = useState(String(dbVersion ?? ""));
+  const tableCount = schema?.tables.filter((table) => table.type === "table").length ?? 0;
+  const viewCount = schema?.tables.filter((table) => table.type === "view").length ?? 0;
+  const sizeText = schema ? `${Math.round((schema.page_count * schema.page_size) / 1024)} KB` : "-";
+
+  useEffect(() => {
+    setDraftVersion(String(dbVersion ?? ""));
+  }, [dbVersion]);
+
+  return (
+    <div className="health-panel">
+      <div className="health-metrics">
+        <span><strong>{tableCount}</strong> Tables</span>
+        <span><strong>{viewCount}</strong> Views</span>
+        <span className="db-version-card">
+          <strong>DB Version</strong>
+          <label>
+            <input
+              type="number"
+              min={0}
+              value={draftVersion}
+              onChange={(event) => setDraftVersion(event.target.value)}
+            />
+            <button onClick={() => onSaveVersion(Number(draftVersion))}>Save</button>
+          </label>
+          {versionStatus && <small>{versionStatus}</small>}
+        </span>
+        <span><strong>{sizeText}</strong> Estimated Size</span>
+      </div>
+      <div className="health-actions">
+        <button onClick={onIntegrity}><CheckCircle2 size={16} /> Integrity Check</button>
+        <button onClick={onForeign}><Network size={16} /> Foreign Key Check</button>
+      </div>
+      <div className="health-score">
+        <strong>{checkDetails.length ? "Issues Found" : "Schema Health"}</strong>
+        <span>{checkStatus || "Run checks to validate database integrity and relationships."}</span>
+        <b>{checkDetails.length ? `${checkDetails.length} issue(s)` : `${schema?.tables.length ?? 0} objects`}</b>
+      </div>
+      {checkDetails.length > 0 && (
+        <div className="health-details">
+          {checkDetails.slice(0, 50).map((row, index) => (
+            <code key={index}>{JSON.stringify(row)}</code>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueryComparePanel({
+  leftSql,
+  rightSql,
+  setLeftSql,
+  setRightSql,
+  caseSensitive,
+  setCaseSensitive,
+  compareResult,
+  onCompare
+}: {
+  leftSql: string;
+  rightSql: string;
+  setLeftSql: (sql: string) => void;
+  setRightSql: (sql: string) => void;
+  caseSensitive: boolean;
+  setCaseSensitive: (value: boolean) => void;
+  compareResult: SqlTextCompareResult | null;
+  onCompare: () => void;
+}) {
+  const removalCount = compareResult?.leftOnly.length ?? 0;
+  const additionCount = compareResult?.rightOnly.length ?? 0;
+  const maxDiffRows = Math.max(removalCount, additionCount);
+  const renderDiffText = (text: string, pairedText: string, side: "left" | "right") => {
+    const parts = side === "left"
+      ? diffWordParts(text, pairedText, caseSensitive).left
+      : diffWordParts(pairedText, text, caseSensitive).right;
+    return parts.map((part, index) => (
+      <mark key={`${part.text}-${index}`} className={part.changed ? "changed" : ""}>
+        {part.text}
+      </mark>
+    ));
+  };
+
+  return (
+    <div className="query-compare-panel">
+      <div className="compare-query-editors">
+        <label>
+          <span>Query A</span>
+          <textarea value={leftSql} onChange={(event) => setLeftSql(event.target.value)} spellCheck={false} />
+        </label>
+        <label>
+          <span>Query B</span>
+          <textarea value={rightSql} onChange={(event) => setRightSql(event.target.value)} spellCheck={false} />
+        </label>
+      </div>
+      <div className="compare-target-row">
+        <label className="compare-case-toggle">
+          <input
+            type="checkbox"
+            checked={caseSensitive}
+            onChange={(event) => setCaseSensitive(event.target.checked)}
+          />
+          Case sensitive match
+        </label>
+        <button onClick={onCompare}><GitCompare size={16} /> Compare Queries</button>
+      </div>
+      {compareResult ? (
+        <div className={compareResult.match ? "compare-status matched" : "compare-status mismatched"}>
+          <strong>{compareResult.match ? "Matched" : "Mismatched"}</strong>
+          <span>{compareResult.sharedCount} shared {caseSensitive ? "case-sensitive" : "case-insensitive"} SQL line(s)</span>
+        </div>
+      ) : (
+        <div className="muted-block compact">Paste two SQL queries to compare their text structure.</div>
+      )}
+      {compareResult && (
+        <div className="sql-text-diff">
+          <div className="sql-diff-pane removed">
+            <header>
+              <strong>{removalCount} removal{removalCount === 1 ? "" : "s"}</strong>
+              <span>{compareResult.leftLineCount} line{compareResult.leftLineCount === 1 ? "" : "s"}</span>
+            </header>
+            <div className="sql-diff-lines">
+              {maxDiffRows ? Array.from({ length: maxDiffRows }).map((_, index) => (
+                <code key={index} className={compareResult.leftOnly[index] ? "" : "empty"}>
+                  <b>{compareResult.leftOnly[index] ? index + 1 : ""}</b>
+                  <span>
+                    {compareResult.leftOnly[index]
+                      ? renderDiffText(compareResult.leftOnly[index], compareResult.rightOnly[index] ?? "", "left")
+                      : ""}
+                  </span>
+                </code>
+              )) : (
+                <code className="empty"><b /> <span>No removals</span></code>
+              )}
+            </div>
+          </div>
+          <div className="sql-diff-pane added">
+            <header>
+              <strong>{additionCount} addition{additionCount === 1 ? "" : "s"}</strong>
+              <span>{compareResult.rightLineCount} line{compareResult.rightLineCount === 1 ? "" : "s"}</span>
+            </header>
+            <div className="sql-diff-lines">
+              {maxDiffRows ? Array.from({ length: maxDiffRows }).map((_, index) => (
+                <code key={index} className={compareResult.rightOnly[index] ? "" : "empty"}>
+                  <b>{compareResult.rightOnly[index] ? index + 1 : ""}</b>
+                  <span>
+                    {compareResult.rightOnly[index]
+                      ? renderDiffText(compareResult.rightOnly[index], compareResult.leftOnly[index] ?? "", "right")
+                      : ""}
+                  </span>
+                </code>
+              )) : (
+                <code className="empty"><b /> <span>No additions</span></code>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2152,6 +3329,7 @@ function ResultTable({
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [sort, setSort] = useState<{ column: string; direction: "asc" | "desc" } | null>(null);
   const [renderLimit, setRenderLimit] = useState(renderStep);
+  const [selectedJsonCell, setSelectedJsonCell] = useState<{ column: string; value: unknown } | null>(null);
 
   const visibleRows = useMemo(() => {
     if (!result) return [];
@@ -2237,6 +3415,7 @@ function ResultTable({
             <tr key={rowIndex} onClick={() => onOpenRow(row)}>
               {result.columns.map((column) => {
                 const fk = fkByColumn.get(column);
+                const jsonValue = parseJsonValue(row[column]);
                 return (
                   <td key={column} className={fkColumns.has(column) ? "fk-cell" : ""}>
                     {fk ? (
@@ -2253,6 +3432,19 @@ function ResultTable({
                       >
                         {valueText(row[column])}
                       </button>
+                    ) : jsonValue.ok ? (
+                      <div className="json-cell">
+                        <span title={formattedValueText(row[column])}>{valueText(row[column])}</span>
+                        <button
+                          className="json-pretty-button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setSelectedJsonCell({ column, value: row[column] });
+                          }}
+                        >
+                          Pretty
+                        </button>
+                      </div>
                     ) : (
                       valueText(row[column])
                     )}
@@ -2287,6 +3479,43 @@ function ResultTable({
           )}
         </tbody>
       </table>
+      {selectedJsonCell && (
+        <JsonPrettyModal
+          column={selectedJsonCell.column}
+          value={selectedJsonCell.value}
+          onClose={() => setSelectedJsonCell(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function JsonPrettyModal({
+  column,
+  value,
+  onClose
+}: {
+  column: string;
+  value: unknown;
+  onClose: () => void;
+}) {
+  const parsed = parseJsonValue(value);
+  const pretty = parsed.ok ? JSON.stringify(parsed.value, null, 2) : formattedValueText(value);
+
+  return (
+    <div className="field-detail-backdrop" onClick={onClose}>
+      <section className="field-detail-modal json-pretty-modal" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div>
+            <span className="eyebrow">Pretty JSON</span>
+            <h3>{column}</h3>
+          </div>
+          <button onClick={onClose}>Close</button>
+        </header>
+        <div className="json-pretty-body">
+          <pre>{pretty}</pre>
+        </div>
+      </section>
     </div>
   );
 }
@@ -2303,7 +3532,7 @@ function RowModal({
   rowKey: Record<string, unknown>;
   table: string;
   canEdit: boolean;
-  onSave: (key: Record<string, unknown>, values: Record<string, unknown>) => Promise<RowUpdateResult>;
+  onSave: (key: Record<string, unknown>, values: Record<string, unknown>) => Promise<void>;
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState<Record<string, string>>(() =>
@@ -2312,7 +3541,6 @@ function RowModal({
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
-  const [generatedPath, setGeneratedPath] = useState<string | null>(null);
 
   const changedValues = useMemo(() => {
     const values: Record<string, unknown> = {};
@@ -2333,27 +3561,15 @@ function RowModal({
   async function saveChanges() {
     if (!hasChanges || isSaving) return;
     setIsSaving(true);
-    setSaveStatus("Saving row");
-    setGeneratedPath(null);
+    setSaveStatus("Staging row changes");
     try {
-      const response = await onSave(rowKey, changedValues);
-      setSaveStatus(response.mode === "repacked" ? "Edited copy created. Save the new .vyb file." : "Saved directly.");
-      setGeneratedPath(response.output_vyb ?? null);
+      await onSave(rowKey, changedValues);
+      setSaveStatus("Changes staged.");
       setIsEditing(false);
     } catch (error) {
-      setSaveStatus(error instanceof Error ? error.message : "Unable to save row.");
+      setSaveStatus(error instanceof Error ? error.message : "Unable to stage row changes.");
     } finally {
       setIsSaving(false);
-    }
-  }
-
-  async function saveGeneratedCopy() {
-    if (!generatedPath || !window.dbcompare?.saveGeneratedFile) return;
-    const result = await window.dbcompare.saveGeneratedFile(generatedPath, fileNameFromPath(generatedPath));
-    if (result.error) {
-      setSaveStatus(result.error);
-    } else if (result.saved && result.path) {
-      setSaveStatus(`Saved copy to ${result.path}`);
     }
   }
 
@@ -2378,9 +3594,6 @@ function RowModal({
           <div className="row-edit-bar">
             <span>{Object.keys(rowKey).length} key field(s)</span>
             {saveStatus && <strong>{saveStatus}</strong>}
-            {generatedPath && (
-              <button onClick={saveGeneratedCopy}>Save edited .vyb copy</button>
-            )}
           </div>
         )}
         <div className="row-fields">
@@ -2402,7 +3615,7 @@ function RowModal({
         {isEditing && (
           <footer className="row-save-footer">
             <button disabled={!hasChanges || isSaving} onClick={saveChanges}>
-              {isSaving ? "Saving..." : "Save changes"}
+              {isSaving ? "Staging..." : "Stage changes"}
             </button>
             <span>{hasChanges ? `${Object.keys(changedValues).length} field(s) changed` : "No changes"}</span>
           </footer>

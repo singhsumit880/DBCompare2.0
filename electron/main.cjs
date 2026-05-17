@@ -23,12 +23,16 @@ const requiredDevRoutes = [
   "/api/tools/settings-repair",
   "/api/sql/tables",
   "/api/sql/table-info",
+  "/api/sql/schema",
   "/api/sql/checks",
   "/api/sql/version",
   "/api/sql/rows",
   "/api/sql/update-row",
+  "/api/sql/update-rows-batch",
   "/api/sql/related-rows",
-  "/api/sql/query"
+  "/api/sql/query",
+  "/api/sql/compare-query",
+  "/api/sql/export"
 ];
 
 function backendExecutable() {

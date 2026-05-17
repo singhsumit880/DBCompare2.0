@@ -1,4 +1,18 @@
-import type { CompareJobStatus, ComparisonReport, RowUpdateResult, SqlQueryResult, TableColumn, ToolRunResult } from "./types";
+import type {
+  CompareJobStatus,
+  ComparisonReport,
+  DatabaseSchemaResult,
+  ExportFormat,
+  ExportResult,
+  ExportSource,
+  BatchRowEdit,
+  BatchRowUpdateResult,
+  QueryCompareResult,
+  RowUpdateResult,
+  SqlQueryResult,
+  TableColumn,
+  ToolRunResult
+} from "./types";
 
 const baseUrl = window.dbcompare?.apiBaseUrl ?? "http://127.0.0.1:8765";
 
@@ -87,6 +101,10 @@ export function tableInfo(dbPath: string, table: string) {
   }>("/api/sql/table-info", { db_path: dbPath, table });
 }
 
+export function databaseSchema(dbPath: string) {
+  return post<DatabaseSchemaResult>("/api/sql/schema", { db_path: dbPath });
+}
+
 export function databaseChecks(dbPath: string) {
   return post<{
     user_version: number;
@@ -120,12 +138,46 @@ export function updateRow(
   });
 }
 
+export function updateRowsBatch(dbPath: string, edits: BatchRowEdit[]) {
+  return post<BatchRowUpdateResult>("/api/sql/update-rows-batch", {
+    db_path: dbPath,
+    edits
+  });
+}
+
 export function executeSql(dbPath: string, sql: string, allowWrite = false, limit = 500) {
   return post<SqlQueryResult>("/api/sql/query", {
     db_path: dbPath,
     sql,
     allow_write: allowWrite,
     limit
+  });
+}
+
+export function compareQuery(dbPath: string, leftSql: string, rightSql: string, limit = 1000) {
+  return post<QueryCompareResult>("/api/sql/compare-query", {
+    db_path: dbPath,
+    left_sql: leftSql,
+    right_sql: rightSql,
+    limit
+  });
+}
+
+export function exportSqlData(payload: {
+  dbPath: string;
+  source: ExportSource;
+  format: ExportFormat;
+  table?: string;
+  sql?: string;
+  limit?: number;
+}) {
+  return post<ExportResult>("/api/sql/export", {
+    db_path: payload.dbPath,
+    source: payload.source,
+    format: payload.format,
+    table: payload.table,
+    sql: payload.sql,
+    limit: payload.limit ?? 10000
   });
 }
 

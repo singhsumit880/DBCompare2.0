@@ -59,13 +59,64 @@ export type SqlQueryResult = {
   columns: string[];
   rows: Record<string, unknown>[];
   row_count: number;
-  truncated_at?: number;
+  affected_rows?: number;
+  elapsed_ms?: number;
+  truncated?: boolean;
+  truncated_at?: number | null;
 };
 
 export type TableColumn = {
+  cid?: number;
   name: string;
   type: string;
+  notnull?: boolean;
+  default?: unknown;
   pk: number;
+};
+
+export type DatabaseSchemaTable = {
+  name: string;
+  type: "table" | "view";
+  sql: string | null;
+  row_count: number | null;
+  columns: TableColumn[];
+  foreign_keys: {
+    id?: number;
+    seq?: number;
+    table: string;
+    from: string;
+    to: string;
+    on_update?: string;
+    on_delete?: string;
+    match?: string;
+  }[];
+  indexes: Record<string, unknown>[];
+};
+
+export type DatabaseSchemaResult = {
+  tables: DatabaseSchemaTable[];
+  user_version: number;
+  page_count: number;
+  page_size: number;
+};
+
+export type QueryCompareResult = {
+  columns: string[];
+  left: SqlQueryResult;
+  right: SqlQueryResult;
+  only_in_db1: Record<string, unknown>[];
+  only_in_db2: Record<string, unknown>[];
+  common_count: number;
+  match: boolean;
+};
+
+export type ExportSource = "table" | "query" | "database" | "schema";
+export type ExportFormat = "csv" | "sql" | "sqlite" | "vyp" | "vyb";
+
+export type ExportResult = {
+  path: string;
+  format: string;
+  row_count: number | null;
 };
 
 export type RowUpdateResult = {
@@ -74,6 +125,18 @@ export type RowUpdateResult = {
   mode: "direct" | "repacked";
   output_vyp?: string | null;
   output_vyb?: string | null;
+};
+
+export type BatchRowEdit = {
+  table: string;
+  key: Record<string, unknown>;
+  values: Record<string, unknown>;
+};
+
+export type BatchRowUpdateResult = {
+  path: string;
+  format: string;
+  updated_count: number;
 };
 
 export type ToolRunResult = {
