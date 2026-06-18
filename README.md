@@ -381,6 +381,3 @@ Pull requests are welcome. If you add features that require new dependencies, up
 
 Please keep core database behavior in `core/` where possible so both UI layers can reuse it.
 
-## License
-
-No license file is currently included. Add a license before distributing publicly if this repository will be open sourced.
