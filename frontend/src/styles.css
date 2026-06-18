@@ -1222,6 +1222,7 @@ tbody tr.clean td {
   grid-template-rows: auto auto minmax(0, 1fr);
   width: min(980px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
+  min-height: 0;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1229,11 +1230,14 @@ tbody tr.clean td {
   box-shadow: 0 20px 70px rgb(15 23 42 / 24%);
 }
 
+.field-detail-modal.has-json-diff {
+  grid-template-rows: auto auto minmax(170px, 32vh) minmax(0, 1fr);
+}
+
 .json-diff-section {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  min-height: 180px;
-  max-height: 280px;
+  min-height: 0;
   border-bottom: 1px solid var(--line);
   overflow: hidden;
 }
@@ -1259,27 +1263,51 @@ tbody tr.clean td {
 
 .json-diff-table-wrap {
   min-height: 0;
+  max-width: 100%;
   overflow: auto;
 }
 
 .json-diff-table {
+  width: 100%;
+  min-width: 760px;
   table-layout: fixed;
+  border-collapse: collapse;
 }
 
 .json-diff-table th:nth-child(1),
 .json-diff-table td:nth-child(1) {
-  width: 260px;
+  width: 28%;
 }
 
 .json-diff-table th:nth-child(2),
 .json-diff-table td:nth-child(2) {
-  width: 110px;
+  width: 128px;
+  white-space: nowrap;
 }
 
+.json-diff-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #edf4ff;
+}
+
+.json-diff-table th,
 .json-diff-table td {
+  min-width: 0;
   vertical-align: top;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.json-diff-table th:nth-child(2),
+.json-diff-table td:nth-child(2) {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.json-diff-table td {
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 13px;
 }
@@ -1365,6 +1393,7 @@ tbody tr.clean td {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
   min-height: 0;
+  max-width: 100%;
   overflow: hidden;
   padding: 12px;
 }
@@ -1855,6 +1884,10 @@ tbody tr.clean td {
   width: 100%;
   min-height: 180px;
   align-items: center;
+}
+
+.startup-summary {
+  min-height: 160px;
 }
 
 .table-browser,

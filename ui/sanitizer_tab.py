@@ -27,6 +27,8 @@ INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.TRANSACTIONMESSAGEENABLED', '0');
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.VYAPAR.SYNCENABLED', '0');
 UPDATE kb_transactions SET mobile_no = '';
+UPDATE kb_transactions SET additional_details_json = NULL;
+UPDATE repeat_invoice_template SET next_due_date = NULL, end_date = NULL, week_days = NULL, on_day = NULL, paused_until = NULL, txn_json = '{}';
 """
 
 
