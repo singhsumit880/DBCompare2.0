@@ -10,6 +10,7 @@ let apiProcess = null;
 let apiPort = null;
 let apiBaseUrl = null;
 let backendStartupError = null;
+let backendReady = false;
 let initialOpenFile = null;
 const requiredDevRoutes = [
   "/api/compare",
@@ -195,28 +196,6 @@ function createWindow() {
     }
   });
 
-  if (backendStartupError) {
-    const escaped = backendStartupError.replace(/[&<>"']/g, (char) => ({
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      "\"": "&quot;",
-      "'": "&#39;"
-    }[char]));
-    win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
-      <html>
-        <head><title>DB Explorer Pro</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 40px; color: #111827;">
-          <h1>Backend could not start</h1>
-          <p>DB Explorer Pro could not start its local API service.</p>
-          <pre style="white-space: pre-wrap; background: #f3f4f6; padding: 16px; border-radius: 8px;">${escaped}</pre>
-          <p>Please restart the app. If the issue continues, check antivirus permissions or install the backend build dependency.</p>
-        </body>
-      </html>
-    `)}`);
-    return;
-  }
-
   win.setMenuBarVisibility(false);
 
   if (isDev) {
@@ -271,20 +250,33 @@ app.whenReady().then(async () => {
   apiPort = await findFreePort();
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;
   await prepareDevBackendPort();
+  createWindow();
   try {
     startBackend();
     await waitForBackend();
+    backendReady = true;
   } catch (error) {
     backendStartupError = error instanceof Error ? error.message : String(error);
   }
-  createWindow();
 });
 
-ipcMain.handle("backend:status", async () => ({
-  ok: !backendStartupError,
-  apiBaseUrl,
-  error: backendStartupError
-}));
+ipcMain.handle("backend:status", async () => {
+  if (backendReady) {
+    return { ok: true, apiBaseUrl, error: null };
+  }
+
+  const ok = await hasCurrentBackendRoutes().catch(() => false);
+  if (ok) {
+    backendReady = true;
+    backendStartupError = null;
+  }
+
+  return {
+    ok,
+    apiBaseUrl,
+    error: ok ? null : backendStartupError
+  };
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

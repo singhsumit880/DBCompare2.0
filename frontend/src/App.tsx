@@ -83,7 +83,9 @@ INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.TXNUPDATEMESSAGEENABLED', '0');
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.TRANSACTIONMESSAGEENABLED', '0');
 INSERT OR REPLACE INTO kb_settings (setting_key, setting_value) VALUES ('VYAPAR.VYAPAR.SYNCENABLED', '0');
-UPDATE kb_transactions SET mobile_no = '';`;
+UPDATE kb_transactions SET mobile_no = '';
+UPDATE kb_transactions SET additional_details_json = NULL;
+UPDATE repeat_invoice_template SET next_due_date = NULL, end_date = NULL, week_days = NULL, on_day = NULL, paused_until = NULL, txn_json = '{}';`;
 
 const SQL_KEYWORDS = [
   "SELECT",
@@ -483,12 +485,42 @@ export function App() {
   const [db1, setDb1] = useState("");
   const [db2, setDb2] = useState("");
   const [activeDb, setActiveDb] = useState("");
+  const [backendReady, setBackendReady] = useState(false);
+  const [backendError, setBackendError] = useState<string | null>(null);
 
   useEffect(() => {
     const launchFile = window.dbcompare?.initialOpenFile;
     if (!launchFile) return;
     setActiveDb(launchFile);
     setScreen("sql");
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function pollBackend() {
+      while (!cancelled) {
+        try {
+          const status = await window.dbcompare?.backendStatus();
+          if (cancelled) return;
+          if (status?.ok) {
+            setBackendReady(true);
+            setBackendError(null);
+            return;
+          }
+          setBackendError(status?.error ?? null);
+        } catch (error) {
+          if (cancelled) return;
+          setBackendError(error instanceof Error ? error.message : "Local service is still starting.");
+        }
+        await sleep(350);
+      }
+    }
+
+    pollBackend();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
@@ -536,7 +568,19 @@ export function App() {
       </aside>
 
       <section className="workspace">
-        {screen === "compare" ? (
+        {!backendReady ? (
+          <section className="sql-empty-start">
+            <div className="hero-summary startup-summary">
+              <div>
+                <h1>Starting DB Explorer Pro</h1>
+                <p>The window is ready. The local database service is warming up in the background.</p>
+              </div>
+              <div className="summary-pills">
+                <span>{backendError ? backendError : "Starting local service..."}</span>
+              </div>
+            </div>
+          </section>
+        ) : screen === "compare" ? (
           <CompareWorkspace db1={db1} db2={db2} setDb1={setDb1} setDb2={setDb2} />
         ) : screen === "sqlCompare" ? (
           <SqlCompareWorkspace />
@@ -1851,7 +1895,7 @@ function FieldDetailModal({
   const jsonDiff = jsonDiffForValues(db1Value, db2Value);
   return (
     <div className="field-detail-backdrop" onClick={onClose}>
-      <section className="field-detail-modal" onClick={(event) => event.stopPropagation()}>
+      <section className={`field-detail-modal ${jsonDiff ? "has-json-diff" : ""}`} onClick={(event) => event.stopPropagation()}>
         <header>
           <div>
             <span className="eyebrow">Changed field</span>
